@@ -1,0 +1,207 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Shared settings (TargetFramework, LangVersion, GameManagedDir, TestProfileRoot,
+       BepInEx paths, CompanyRepoRoot, restore sources) live in ..\Directory.Build.props. -->
+  <PropertyGroup>
+    <AssemblyName>Y4NGZMonitorTakeover</AssemblyName>
+    <!-- Deliberately NOT Y4NGZMonitorTakeover, for the same reason Y4NGZShipSystems.csproj gives:
+         the namespaces this assembly vends are frozen (Y4NGZCompany.ShipSystems.Takeover.*,
+         Y4NGZCompany.Bootstrap.TakeoverBootstrap, Y4NGZCompany.Core.*) because external mods and
+         this repository's own reflection probes resolve them by string. RootNamespace only affects
+         new files' default namespace, and every file here declares its own, but leaving it at
+         Y4NGZCompany keeps the two in step. -->
+    <RootNamespace>Y4NGZCompany</RootNamespace>
+    <Description>Y4NGZ monitor takeover: the quota milestone registry and its rewards, milestone unlock gating, the quota announcement, the monitor takeover presentation, and Mask Man</Description>
+    <Version>1.0.0</Version>
+    <!-- Same symbol Y4NGZCompany and Y4NGZShipSystems define. TakeoverAudioOverrides.cs,
+         QuotaTakeoverDebugController.cs and the quota-progression payload path all contain #if
+         blocks gated on it, so omitting it here would silently compile a DIFFERENT Monitor
+         Takeover than the monolith shipped - the loose-file audio overrides and the forced-quota
+         debug path would simply not exist. -->
+    <DefineConstants>$(DefineConstants);Y4NGZCOMPANY_CUSTOMPASS_PUBLIC</DefineConstants>
+    <!-- No NoWarn here on purpose, exactly as Y4NGZShipSystems.csproj argues: Y4NGZCompany.csproj
+         suppresses CS0436 for its own historical reasons and this project must not inherit that
+         habit. A type-conflict warning is the one signal that would catch a second accidental
+         duplicate of a Y4NGZCompany.* type across the three feature assemblies - and this
+         assembly declares types in BOTH Y4NGZCompany.Core and Y4NGZCompany.ShipSystems.Takeover,
+         namespaces the other two also populate, so it is the assembly that needs the signal most. -->
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!-- Same two-layout hazard the sibling projects document: a Gale-imported profile holds
+         `Y4NGZMonitorTakeover`, a hand-made one holds `y4ngz-Y4NGZMonitorTakeover`. Prefer
+         whichever already exists, newest layout first, so a Release build never writes into the
+         directory BepInEx is not loading from. -->
+    <DeployTarget Condition="'$(DeployTarget)' == '' and Exists('$(BepInExPlugins)\Y4NGZMonitorTakeover')">$(BepInExPlugins)\Y4NGZMonitorTakeover</DeployTarget>
+    <DeployTarget Condition="'$(DeployTarget)' == ''">$(BepInExPlugins)\y4ngz-Y4NGZMonitorTakeover</DeployTarget>
+    <!-- TakeoverBootstrap.LoadBundle resolves the bundle relative to
+         Assembly.GetExecutingAssembly().Location with no fallback, so the payload has to ship in
+         THIS plugin's directory rather than Contracted's. Same resolution order Y4NGZCompany used
+         while it owned the item: the gitignored runtime-assets copy first, the release staging
+         copy second. The legacy .lethalbundle name is what the shipped asset is actually called;
+         the loader probes monitortakeover.bundle first and falls back to it. -->
+    <MonitorTakeoverLegacyBundleSourcePath Condition="Exists('..\..\runtime-assets\monitortakeover.lethalbundle')">..\..\runtime-assets\monitortakeover.lethalbundle</MonitorTakeoverLegacyBundleSourcePath>
+    <MonitorTakeoverLegacyBundleSourcePath Condition="'$(MonitorTakeoverLegacyBundleSourcePath)' == ''">..\..\release\staging\yangz_mods\monitortakeover.lethalbundle</MonitorTakeoverLegacyBundleSourcePath>
+    <!-- #668. The takeover video ships LOOSE, beside the bundle, and is played
+         through VideoPlayer.url. The bundled VideoClip was authored with
+         enableTranscoding = false, so it holds no media at all - only the
+         authoring machine's `Assets/ModAssets/...` path, which every player's
+         Prepare answers with "Cannot read file". Same source order the bundle
+         uses: the runtime-assets copy first, the release staging copy second.
+         TakeoverBootstrap.ResolveTakeoverVideoPath probes the plugin directory,
+         so this file has to land beside Y4NGZMonitorTakeover.dll. -->
+    <MonitorTakeoverVideoSourcePath Condition="Exists('..\..\runtime-assets\y4ngz_monitor_takeover.mp4')">..\..\runtime-assets\y4ngz_monitor_takeover.mp4</MonitorTakeoverVideoSourcePath>
+    <MonitorTakeoverVideoSourcePath Condition="'$(MonitorTakeoverVideoSourcePath)' == ''">..\..\release\staging\yangz_mods\y4ngz_monitor_takeover.mp4</MonitorTakeoverVideoSourcePath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="BepInEx.Analyzers" Version="1.*" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.AssemblyPublicizer.MSBuild" Version="0.4.2" PrivateAssets="all" />
+    <PackageReference Include="BepInEx.Core" Version="5.4.21" PrivateAssets="all" />
+    <!-- BepInEx.PluginInfoProps is deliberately ABSENT, for the reason Y4NGZShipSystems.csproj
+         records (#613 task 2.1, V7): it generates a public `MyPluginInfo` into $(RootNamespace),
+         which here is Y4NGZCompany - the namespace Y4NGZCompany.dll already exports one into.
+         Two assemblies exporting `Y4NGZCompany.MyPluginInfo` is CS0433 for any consumer of both,
+         and the package exposes no knob to change it. Nothing here reads MyPluginInfo: the
+         plugin's GUID/name/version are the const fields on MonitorTakeoverPlugin, which is where
+         [BepInPlugin] reads them from. -->
+    <PackageReference Include="HarmonyX" Version="2.10.2" PrivateAssets="all" />
+    <PackageReference Include="LethalCompany.GameLibs.Steam" Version="81.0.5-ngd.0" Publicize="true" PrivateAssets="all" />
+    <PackageReference Include="UnityEngine.Modules" Version="2022.3.62" IncludeAssets="compile" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="Unity.InputSystem">
+      <HintPath>$(GameManagedDir)\Unity.InputSystem.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.Netcode.Runtime">
+      <HintPath>$(GameManagedDir)\Unity.Netcode.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(GameManagedDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AssetBundleModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.AssetBundleModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AIModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.AIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.AnimationModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.AnimationModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ParticleSystemModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.ParticleSystemModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>$(GameManagedDir)\UnityEngine.UI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.UnityWebRequestModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.UnityWebRequestModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.VideoModule">
+      <HintPath>$(GameManagedDir)\UnityEngine.VideoModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.RenderPipelines.HighDefinition.Runtime">
+      <HintPath>$(GameManagedDir)\Unity.RenderPipelines.HighDefinition.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Unity.RenderPipelines.Core.Runtime">
+      <HintPath>$(GameManagedDir)\Unity.RenderPipelines.Core.Runtime.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Private=false: Y4NGZCore deploys its own DLL from its own project, so copying it into this
+       project's output would put a second copy in the profile.
+
+       Y4NGZCore is the ONLY project reference, and that is this task's architectural commitment
+       (#614 task 3.1): Monitor Takeover must load with Core and NOTHING else. A reference to
+       Y4NGZCompany would make Contracted a hard dependency of this plugin; a reference to
+       Y4NGZShipSystems would make Ship Systems one. Neither exists, and neither may be added -
+       the reverse directions are absent too, so all three feature assemblies talk only through
+       Y4NGZCore contracts. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Y4NGZCore\Y4NGZCore.csproj" Private="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Content Include="$(MonitorTakeoverLegacyBundleSourcePath)" Link="monitortakeover.lethalbundle" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(MonitorTakeoverLegacyBundleSourcePath)')" />
+    <Content Include="$(MonitorTakeoverVideoSourcePath)" Link="y4ngz_monitor_takeover.mp4" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(MonitorTakeoverVideoSourcePath)')" />
+    <!-- #614 task 3.1. The quota announcement's per-line tick sting. This is a COPY of
+         src\Y4NGZCompany\assets\audio\contracts\UI\digital_text_sequence_terminal_01.wav, not a
+         move: Contracted still plays the same file itself
+         (ContractHUDManager.cs:104 / :1557-1574, the contract typewriter), so removing it from
+         Contracted's glob would have silenced that instead.
+
+         The clip has to ship with the assembly that loads it. QuotaUnlockAnnouncement.LoadTickAudio
+         resolves relative to its OWN assembly first, and since this feature left Y4NGZCompany.dll
+         that directory is this package's - which held no audio at all until this item existed, so
+         the announcement's tick was unresolvable on any profile without Contracted installed, and
+         silently so.
+
+         Deployed under Audio\UI rather than reusing Contracted's ContractAudio\UI name: this is
+         not contract audio and calling it that in a package that ships no contracts would be a
+         lie that the next reader has to disprove. The resolver still probes Contracted's
+         ContractAudio\UI as a later fallback, under BOTH profile layout names. -->
+    <Content Include="assets\audio\ui\*.wav" Link="Audio\UI\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!--
+    Release only, exactly like the sibling projects: a Debug build must never write into the live
+    Gale profile. `dotnet build -c Debug` therefore compiles and deploys nothing.
+
+    THERE IS NO netcode-patch STEP HERE, and that is a verified finding rather than an omission
+    (#614 task 3.1).
+
+      - This assembly declares ZERO NetworkBehaviour subclasses and ZERO [ServerRpc]/[ClientRpc]
+        methods. Every RPC identifier in these sources is either a call to a VANILLA game RPC
+        (QuotaProgressionRegistry.cs SyncGroupCreditsServerRpc) or a HarmonyPatch TARGETING a
+        vanilla one (Patches.cs). NetcodePatcher weaves declarations, not calls or patches, so
+        there is nothing here for it to weave.
+      - This plugin's whole wire surface is CustomMessagingManager named messages -
+        QuotaUnlockAnnouncement's one, QuotaTakeoverDebugController's one, and
+        QuotaProgressionRegistry's - which the patcher does not touch at all.
+      - Consequently MonitorTakeoverPlugin.Awake does NOT call
+        Y4NGZCompany.Core.NetcodeRuntimeBootstrap.Initialize. That method throws when it finds
+        zero [RuntimeInitializeOnLoadMethod] initializers (NetcodeRuntimeBootstrap.cs:65-70), and
+        an unwoven assembly has zero by definition - so calling it here would kill this plugin at
+        Awake every single launch. Ship Systems calls it because two of ITS types really are
+        NetworkBehaviours and the weave emits a serialization helper for them.
+
+    What still has to happen on Release is the deploy, so this target is the sibling's target with
+    the weave and its two guards removed and the shared stamped copy kept.
+  -->
+  <Target Name="DeployMonitorTakeover" AfterTargets="Build" Condition="'$(Configuration)' == 'Release'">
+    <CallTarget Targets="DeployY4NGZAssemblyWithStamp" />
+    <ItemGroup>
+      <MonitorTakeoverOutputAssets Include="$(OutputPath)monitortakeover.lethalbundle" />
+      <!-- #668: the loose takeover video rides the same flat copy as the bundle.
+           ResolveTakeoverVideoPath probes $(DeployTarget) itself, so a nested
+           destination would be as invisible as not deploying it at all.
+
+           Existence-conditioned for the same reason the Content item above is:
+           the mp4 is a local artifact in the gitignored-by-convention
+           runtime-assets tree, exactly like monitortakeover.lethalbundle. A
+           worktree that has not been given a copy must still build - it simply
+           deploys a takeover that falls back to the bundled clip, and
+           ResolveTakeoverVideoPath says so in one warning at load. -->
+      <MonitorTakeoverOutputAssets Include="$(OutputPath)y4ngz_monitor_takeover.mp4" Condition="Exists('$(OutputPath)y4ngz_monitor_takeover.mp4')" />
+      <MonitorTakeoverOutputAudio Include="$(OutputPath)Audio\UI\digital_text_sequence_terminal_01.wav" />
+    </ItemGroup>
+    <Copy SourceFiles="@(MonitorTakeoverOutputAssets)" DestinationFolder="$(DeployTarget)" SkipUnchangedFiles="true" Condition="'@(MonitorTakeoverOutputAssets)' != ''" />
+    <!-- RecursiveDir preserves the Audio\UI\ nesting the resolver's first candidate expects; a
+         flat DestinationFolder copy would put the clip at Audio\ and the probe would miss it. -->
+    <Copy SourceFiles="@(MonitorTakeoverOutputAudio)" DestinationFiles="@(MonitorTakeoverOutputAudio->'$(DeployTarget)\Audio\%(RecursiveDir)%(Filename)%(Extension)')" SkipUnchangedFiles="true" Condition="'@(MonitorTakeoverOutputAudio)' != ''" />
+  </Target>
+
+</Project>
