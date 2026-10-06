@@ -50,7 +50,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             if (StartOfRound.Instance == null || TimeOfDay.Instance == null)
                 return Y4NGZCompany.Core.ForcedQuotaCompletionResult.NotInRound;
             if (TakeoverManager.IsActive
-                || QuotaTakeoverHandoff.QuotaJustCompleted || QuotaTakeoverHandoff.MaskManPending)
+                || QuotaTakeoverHandoff.QuotaJustCompleted)
             {
                 return Y4NGZCompany.Core.ForcedQuotaCompletionResult.Busy;
             }
@@ -99,7 +99,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             if (hadQueuedDebugTakeover)
             {
                 QuotaTakeoverHandoff.QuotaJustCompleted = false;
-                QuotaTakeoverHandoff.MaskManPending = false;
             }
         }
 
@@ -224,20 +223,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             if (TimeOfDay.Instance != null)
                 TimeOfDay.Instance.timesFulfilledQuota = completedQuota;
 
-            QuotaTakeoverHandoff.QuotaJustCompleted = false;
-            QuotaTakeoverHandoff.MaskManPending = false;
-
             QuotaUnlockAnnouncement.PrepareDebugReplay(completedQuota);
-            if (completedQuota == 3)
-            {
-                // Debug replay is intentionally repeatable and does not mutate the
-                // natural one-shot Mask Man save key.
-                QuotaTakeoverHandoff.MaskManPending = true;
-            }
-            else
-            {
-                QuotaTakeoverHandoff.QuotaJustCompleted = true;
-            }
+            QuotaTakeoverHandoff.QuotaJustCompleted = true;
 
             _takeoverQueuedUntilOrbit = !startImmediately;
             _queuedCompletedQuota = startImmediately ? 0 : completedQuota;

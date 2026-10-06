@@ -20,7 +20,7 @@ namespace Y4NGZCompany.Bootstrap
         // the other two's patches, silently, whenever that DLL's host object died.
         public const string PLUGIN_GUID = Y4NGZCore.Lifecycle.ModuleHarmonyIds.MonitorTakeover;
         public const string PLUGIN_NAME = "Monitor Takeover";
-        public const string PLUGIN_VERSION = "1.0.1";
+        public const string PLUGIN_VERSION = "1.1.0";
         private const string BUNDLE_FILENAME = "monitortakeover.bundle";
         private const string LEGACY_BUNDLE_FILENAME = "monitortakeover.lethalbundle";
 
@@ -67,7 +67,7 @@ namespace Y4NGZCompany.Bootstrap
         internal static ManualLogSource Log;
 
         // #612 task 1.4: the three quota-rollover handoff flags that used to live here —
-        // QuotaJustCompleted, MaskManPending and FinalEndingPending — moved to
+        // QuotaJustCompleted and its siblings — moved to
         // Y4NGZCore.Modules.Quota.QuotaTakeoverHandoff. They were `internal static` on a type
         // scheduled to land in the Monitor Takeover DLL, and `internal` does not survive an
         // assembly boundary, so any consumer outside that DLL would have stopped compiling at
@@ -118,10 +118,6 @@ namespace Y4NGZCompany.Bootstrap
         // TODO (asset): author and ship a dedicated alarm clip in the bundle.
         internal static AudioClip AlarmClip;
 
-        // Mask Man variant assets (quota-3 one-shot). Loaded from the same bundle.
-        internal static VideoClip MaskManVideoClip;
-        internal static AudioClip MaskManAudioClip;
-
         // Config entries
         internal static ConfigEntry<bool>  CfgEnabled;
         internal static ConfigEntry<float> CfgTakeoverDuration;
@@ -133,13 +129,19 @@ namespace Y4NGZCompany.Bootstrap
         internal static ConfigEntry<float> CfgLightDimIntensity;
         internal static ConfigEntry<bool>  CfgOverrideFifthMonitor;
         internal static ConfigEntry<string> CfgAdditionalMonitorNameTokens;
-        internal static ConfigEntry<float> CfgMaskManTailBuffer;
         internal static ConfigEntry<bool>  CfgVerboseLogging;
         internal static ConfigEntry<bool>  CfgDumpMonitorHierarchyOnOrbit;
 
         // Harmony
         private static Harmony _harmony;
         private static ConfigFile Config;
+
+        /// <summary>
+        /// #861: true once the takeover presentation initialized (enabled, bundle loaded,
+        /// patches applied). The quota registry runs regardless, and only starts decoding a
+        /// takeover's audio files on a peer where a takeover can actually play them.
+        /// </summary>
+        internal static bool PresentationActive { get; private set; }
 
         // --------------------------------------------------------------------
         internal static void Initialize(ConfigFile config, ManualLogSource logger, Harmony harmony)
@@ -181,12 +183,11 @@ namespace Y4NGZCompany.Bootstrap
             QuotaTakeoverDebugController.EnsureAttached(MonitorTakeoverPlugin.CoroutineHost?.gameObject);
 #endif
 
+            PresentationActive = true;
             Log.LogInfo($"{PLUGIN_NAME} v{PLUGIN_VERSION} loaded. " +
                         $"Video file: {(TakeoverVideoPath != null ? "OK" : "MISSING")}, " +
                         $"Video clip (fallback): {(TakeoverVideoClip != null ? "OK" : "MISSING")}, " +
-                        $"Mumble clips: {MumbleClips.Length}/5, " +
-                        $"MaskManVideo: {(MaskManVideoClip != null ? "OK" : "MISSING")}, " +
-                        $"MaskManAudio: {(MaskManAudioClip != null ? "OK" : "MISSING")}");
+                        $"Mumble clips: {MumbleClips.Length}/5.");
         }
 
         // Config
@@ -206,10 +207,13 @@ namespace Y4NGZCompany.Bootstrap
                 "Total seconds the monitor takeover lasts before reverting to normal.");
 
             CfgOrbitDelay = Config.Bind(G, "Orbit Delay", 4.0f,
-                "Seconds to wait after the ship enters orbit before starting the takeover.");
+                "Seconds to wait after the ship enters orbit before starting the takeover. "
+                + "The takeover always waits at least 2 seconds, even at 0, so every player has time "
+                + "to load its audio; the default of 4 is unaffected.");
 
-            CfgMumbleVolume = Config.Bind(A, "Mumble Volume", 0.6f,
-                new ConfigDescription("Volume of Y4NGZ mumble audio (0 = silent, 1 = full).",
+            // #861: "VoiceVolume" in the file (was "Mumble Volume"); the field keeps its name.
+            CfgMumbleVolume = Config.Bind(A, "VoiceVolume", 0.6f,
+                new ConfigDescription("Volume of the mumbled voice lines that play under the typed dialogue (0 = silent, 1 = full). Replace them with your own files through VoiceFiles.",
                     new AcceptableValueRange<float>(0f, 1f)));
 
             CfgTypewriterSpeed = Config.Bind(P, "Typewriter Speed", 0.026f,
@@ -235,11 +239,6 @@ namespace Y4NGZCompany.Bootstrap
             CfgAdditionalMonitorNameTokens = Config.Bind(P, "Additional Monitor Name Tokens", string.Empty,
                 "Optional comma-separated renderer or hierarchy-name filters for additional monitors. Empty overrides every detected extra monitor screen.");
 
-            CfgMaskManTailBuffer = Config.Bind(P, "Mask Man Tail Buffer", 1.5f,
-                new ConfigDescription(
-                    "Seconds of held-on-monitor time after the Mask Man audio clip finishes before restoring.",
-                    new AcceptableValueRange<float>(0f, 10f)));
-
             CfgVerboseLogging = Config.Bind(MonitorTakeoverConfigSchemaMigration.DiagnosticsSection, "Verbose Logging", false,
                 "Log detailed bundle asset names during startup. Leave false for normal play.");
 
@@ -249,10 +248,6 @@ namespace Y4NGZCompany.Bootstrap
                 false,
                 "Writes the full MonitorWall hierarchy to the BepInEx log whenever the ship reaches orbit. Dev-only; leave false for normal play.");
 
-            // Note: the Mask Man one-shot flag is now persisted per-save via ES3
-            // under the key "Y4NGZ_MaskManFired" (see Patches.cs and
-            // TakeoverManager.cs). The previous global [State] config entry has
-            // been removed so each save file gets its own first-time trigger.
         }
 
         // Asset bundle loading
@@ -470,9 +465,9 @@ namespace Y4NGZCompany.Bootstrap
 
                 // Diagnostic dump: every asset name in the bundle.
                 // Unity sometimes lowercases / path-prefixes asset names
-                // (e.g. "assets/modassets/monitortakeover/mask_man_video.mp4").
+                // (e.g. "assets/modassets/monitortakeover/alarm_takeover.wav").
                 // Print them all so the user can confirm the exact strings to
-                // pass to LoadAsset<>() for new assets like Mask Man.
+                // pass to LoadAsset<>() for new assets.
                 if (CfgVerboseLogging.Value)
                 {
                     try
@@ -512,19 +507,6 @@ namespace Y4NGZCompany.Bootstrap
                     Log.LogInfo("Bundle has no 'alarm_takeover' clip - TakeoverManager will fall back to an in-game alarm. " +
                                 "(TODO: ship a dedicated takeover alarm asset.)");
 
-                // Mask Man variant assets (quota-3 one-shot). Null-tolerant -
-                // missing clips just skip the takeover at runtime instead of
-                // failing the whole mod.
-                MaskManVideoClip = LoadFirstAsset<VideoClip>(bundle, "mask_man_video");
-                if (MaskManVideoClip == null)
-                    Log.LogWarning("Could not load 'mask_man_video' from bundle - Mask Man takeover will be skipped. " +
-                                   "Verify the exact asset name from the bundle dump above.");
-
-                MaskManAudioClip = LoadFirstAsset<AudioClip>(bundle, "mask_man_audio");
-                if (MaskManAudioClip == null)
-                    Log.LogWarning("Could not load 'mask_man_audio' from bundle - Mask Man takeover will be skipped. " +
-                                   "Verify the exact asset name from the bundle dump above.");
-
                 // #681. The bundle stays mounted; see the _bundle field comment for
                 // why unloading it here silently broke every takeover clip. The
                 // preload below is not the fix, it is the diagnosis: it forces the
@@ -562,7 +544,6 @@ namespace Y4NGZCompany.Bootstrap
         {
             var clips = new System.Collections.Generic.List<AudioClip>(MumbleClips);
             clips.Add(AlarmClip);
-            clips.Add(MaskManAudioClip);
 
             foreach (AudioClip clip in clips)
             {

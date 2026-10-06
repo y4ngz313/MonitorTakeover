@@ -2,7 +2,6 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
@@ -100,6 +99,16 @@ namespace Y4NGZCompany.Core
         }
 
         internal bool IsOff => Mode == TakeoverSoundtrackMode.Off || string.IsNullOrWhiteSpace(Source);
+
+        /// <summary>
+        /// The published "no soundtrack" plan. #782: `default` on a readonly struct skips the
+        /// constructor, so its strings are null rather than empty, and `SendSoundtrack` turns a
+        /// null <see cref="Hash"/> into a NullReferenceException inside
+        /// <c>FixedString128Bytes(string)</c> - on the host, on every quota completion with the
+        /// default <c>SoundtrackMode = Off</c>. Every path that means "off" returns this instead.
+        /// </summary>
+        internal static readonly TakeoverSoundtrackPlanWire Off =
+            new TakeoverSoundtrackPlanWire(TakeoverSoundtrackMode.Off, string.Empty, string.Empty, 0f);
     }
 
     /// <summary>
@@ -184,6 +193,13 @@ namespace Y4NGZCompany.Core
         internal QuotaTakeoverPayload WithDialogue(string dialogue, int selectionId) =>
             new QuotaTakeoverPayload(Quota, dialogue, MediaFile, MediaHash, selectionId,
                 AlarmAudioFile, AlarmAudioHash, MumbleAudioFiles, MumbleAudioHashes);
+
+        // #861: a new host takeover re-reads the audio files without rerolling the dialogue,
+        // the media or the selection the rollover already fixed.
+        internal QuotaTakeoverPayload WithAudio(
+            string alarmAudioFile, string alarmAudioHash, string mumbleAudioFiles, string mumbleAudioHashes) =>
+            new QuotaTakeoverPayload(Quota, Dialogue, MediaFile, MediaHash, SelectionId,
+                alarmAudioFile, alarmAudioHash, mumbleAudioFiles, mumbleAudioHashes);
     }
 
     // A takeover audio file that has been resolved to an absolute path inside
@@ -192,15 +208,25 @@ namespace Y4NGZCompany.Core
     {
         internal readonly string Path;
         internal readonly string Hash;
+        // #861: which setting and which published name it came from, for diagnostics only.
+        internal readonly string Setting;
+        internal readonly string Name;
 
-        internal TakeoverAudioOverrideFile(string path, string hash)
+        internal TakeoverAudioOverrideFile(string setting, string name, string path, string hash)
         {
+            Setting = setting ?? string.Empty;
+            Name = name ?? string.Empty;
             Path = path ?? string.Empty;
             Hash = hash ?? string.Empty;
         }
 
+        /// <summary>The verified file behind an accepted check; empty for anything else.</summary>
+        internal static TakeoverAudioOverrideFile From(TakeoverAudioFileCheck check) =>
+            check.Accepted ? new TakeoverAudioOverrideFile(check.Setting, check.Name, check.Path, check.Hash) : default;
+
         internal bool IsValid => !string.IsNullOrEmpty(Path);
         internal string CacheKey => (Path ?? string.Empty) + "|" + (Hash ?? string.Empty);
+        internal string Label => (Setting ?? string.Empty) + " '" + (Name ?? string.Empty) + "'";
     }
 
     internal sealed class QuotaMilestoneConfig
@@ -213,6 +239,7 @@ namespace Y4NGZCompany.Core
         internal readonly ConfigEntry<string> UnlockContracts;
         internal readonly ConfigEntry<string> UnlockShipUpgradePurchases;
         internal readonly ConfigEntry<string> UnlockConstellations;
+        internal readonly ConfigEntry<string> UnlockMoons;
         internal readonly ConfigEntry<string> UnlockSuits;
         internal readonly ConfigEntry<string> UnlockStoreItems;
         internal readonly ConfigEntry<int> GrantTokensPerPlayer;
@@ -229,10 +256,12 @@ namespace Y4NGZCompany.Core
             Enable = config.Bind(section, "Enable", true, "Enable this quota milestone.");
             Dialogue = config.Bind(section, "Dialogue", string.Empty, "Inline takeover dialogue. Use \\n for line breaks; blank uses built-in dialogue.");
             DialogueFile = config.Bind(section, "DialogueFile", string.Empty, "Optional UTF-8 .txt file under BepInEx/config/Y4NGZCompany/MonitorTakeovers.");
-            MediaFile = config.Bind(section, "MediaFile", string.Empty, "Optional PNG, JPG, or MP4 filename in BepInEx/config/Y4NGZCompany/MonitorTakeovers used for this quota's takeover, or a full YouTube link (watch, Shorts, Live, Embed, or youtu.be). Files need an identical copy on every player or that player falls back to the built-in media; a YouTube link is downloaded and cached by each player in the background instead.");
+            // #861: the key is "Media" in the file; the field keeps its historical name.
+            MediaFile = config.Bind(section, "Media", string.Empty, "Video (MP4), image (PNG or JPG), or full YouTube link shown on the ship monitors when this quota is completed. Blank uses MediaForAllQuotas from the Media section, and if that is blank too, the built-in Y4NGZ video. Files go in BepInEx/config/Y4NGZCompany/MonitorTakeovers and every player needs an identical copy or they see the built-in video; a YouTube link is downloaded and cached by each player in the background.");
             UnlockContracts = config.Bind(section, "UnlockContracts", string.Empty, "Comma-separated stable contract IDs that begin rolling at this quota.");
             UnlockShipUpgradePurchases = config.Bind(section, "UnlockShipUpgradePurchases", string.Empty, "Comma-separated stable ship-upgrade IDs unlocked for purchase at this quota.");
             UnlockConstellations = config.Bind(section, "UnlockConstellations", string.Empty, "Comma-separated constellation names unlocked at this quota.");
+            UnlockMoons = config.Bind(section, "UnlockMoons", string.Empty, "Comma-separated moon names as the terminal shows them (e.g. Titan, Artifice) that cannot be routed to until this quota. Moons not named in any quota stay available.");
             UnlockSuits = config.Bind(section, "UnlockSuits", string.Empty, "Comma-separated suit unlockable names (as in StartOfRound.unlockablesList, e.g. Green suit) hidden from the suit rack until this quota.");
             UnlockStoreItems = config.Bind(section, "UnlockStoreItems", string.Empty, "Comma-separated store item names (as in Terminal.buyableItemsList, e.g. Pro-flashlight) unavailable for purchase until this quota.");
             GrantTokensPerPlayer = config.Bind(section, "GrantTokensPerPlayer", 3,
@@ -246,6 +275,7 @@ namespace Y4NGZCompany.Core
         internal IEnumerable<string> Contracts => Split(UnlockContracts.Value);
         internal IEnumerable<string> Upgrades => Split(UnlockShipUpgradePurchases.Value);
         internal IEnumerable<string> Constellations => Split(UnlockConstellations.Value);
+        internal IEnumerable<string> Moons => Split(UnlockMoons.Value);
         internal IEnumerable<string> Suits => Split(UnlockSuits.Value);
         internal IEnumerable<string> StoreItems => Split(UnlockStoreItems.Value);
 
@@ -270,24 +300,27 @@ namespace Y4NGZCompany.Core
         // handler drops the message and runs the single-source takeover it always did. The v2
         // payload is untouched, so MonitorTakeoverProtocolRevision stays 1.
         private const string MediaPlanMessage = "Y4NGZCompany.QuotaTakeoverMediaPlan.v1";
+        // #862. Additive for the same reason as the two above: the gate snapshot's four fixed
+        // strings are frozen, so the moon rules ride their own message. A peer that never
+        // registered this handler gates no moons locally; the host still refuses the route.
+        private const string MoonRulesMessage = "Y4NGZCompany.QuotaMoonUnlockRules.v1";
         // Never more entries than the cap could ever open decoders for, and a joined length
         // that leaves headroom inside FixedString4096Bytes for the separators.
         private const int MaxPerMonitorPoolEntries = 6;
         private const int MaxPerMonitorPoolChars = 3000;
         private static readonly Dictionary<int, QuotaMilestoneConfig> Milestones = new Dictionary<int, QuotaMilestoneConfig>();
         private static readonly string[] MediaExtensions = { ".png", ".jpg", ".jpeg", ".mp4" };
-        private static readonly string[] AudioExtensions = { ".mp3", ".wav", ".ogg" };
-        // Per-filename truncation matches the media field; the count and joined
-        // caps keep both index-aligned lists inside their payload fields so a
-        // truncation on the wire can never shift a hash onto the wrong file.
-        private const int MaxOverrideFileNameChars = 120;
+        // Per-filename cap for every name field. #861: TakeoverAudioPolicy owns the value and
+        // rejects an audio name over it before publishing; the send-side truncation below is
+        // therefore a no-op for audio and can never turn one file name into another. The joined
+        // voice caps keep both index-aligned lists inside their payload fields.
+        private const int MaxOverrideFileNameChars = TakeoverAudioPolicy.MaxFileNameChars;
         // A YouTube link travels in the same FixedString512Bytes media field as a
         // filename but is longer than any sane filename; it gets its own cap just
         // under the field's 509-byte capacity instead of the filename cap (#661).
         private const int MaxYoutubeUrlChars = 500;
-        private const int MaxMumbleOverrideClips = 12;
-        private const int MaxMumbleOverrideNameChars = 1000;
-        private const int MaxMumbleOverrideHashChars = 1000;
+        private const int MaxMumbleOverrideNameChars = TakeoverAudioPolicy.MaxVoiceNamesChars;
+        private const int MaxMumbleOverrideHashChars = TakeoverAudioPolicy.MaxVoiceHashesChars;
         private static ConfigEntry<bool> _enabled;
         private static ConfigEntry<bool> _retryPending;
         private static ConfigEntry<bool> _randomizeDialogue;
@@ -301,7 +334,6 @@ namespace Y4NGZCompany.Core
         private static ConfigEntry<bool> _loopMedia;
         private static ConfigEntry<bool> _enableMediaAudio;
         private static ConfigEntry<bool> _useMediaLengthAsDuration;
-        private static ConfigEntry<bool> _randomPerMonitorMedia;
         private static ConfigEntry<string> _perMonitorMediaPool;
         private static ConfigEntry<int> _maxConcurrentMediaPlayers;
         private static ConfigEntry<bool> _enableUnlockAnnouncement;
@@ -324,7 +356,7 @@ namespace Y4NGZCompany.Core
         private static bool _hasCurrentPayload;
         // #715. Default is Off, which is exactly what a peer that never received the sidecar
         // message must see, so no "has published" flag is needed.
-        private static TakeoverSoundtrackPlanWire _soundtrackPlan;
+        private static TakeoverSoundtrackPlanWire _soundtrackPlan = TakeoverSoundtrackPlanWire.Off;
         // #662. Default is an empty pool, which is exactly what a peer that never received the
         // sidecar must see: no per-monitor plan, one shared source.
         private static TakeoverMediaPlanWire _mediaPlan;
@@ -333,6 +365,7 @@ namespace Y4NGZCompany.Core
         private static readonly Dictionary<string, int> AuthoritativeConstellationUnlockQuotas = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, int> AuthoritativeSuitUnlockQuotas = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, int> AuthoritativeStoreItemUnlockQuotas = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, int> AuthoritativeMoonUnlockQuotas = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         private static int _authoritativeQuota;
         private static float _nextSnapshotAt;
         private static string _activeSaveName = string.Empty;
@@ -347,9 +380,9 @@ namespace Y4NGZCompany.Core
 
         internal static string MediaDirectory => Path.Combine(Y4NGZCompanyPaths.LocalDataDir, "MonitorTakeovers");
         internal static bool RandomizeDialogue => _randomizeDialogue?.Value == true;
-        internal static bool LoopMedia => _loopMedia?.Value != false;
-        internal static bool EnableMediaAudio => _enableMediaAudio?.Value == true;
-        internal static bool UseMediaLengthAsDuration => _useMediaLengthAsDuration?.Value == true;
+        internal static bool LoopVideo => _loopMedia?.Value != false;
+        internal static bool PlayVideoSound => _enableMediaAudio?.Value == true;
+        internal static bool HoldForWholeVideo => _useMediaLengthAsDuration?.Value == true;
         internal static bool EnableUnlockAnnouncement => _enableUnlockAnnouncement?.Value != false;
         internal static float UnlockAnnouncementSeconds => _unlockAnnouncementSeconds?.Value ?? 4.5f;
         internal static bool AnnounceOnBothMonitors => _announceOnBothMonitors?.Value == true;
@@ -361,10 +394,11 @@ namespace Y4NGZCompany.Core
         internal static bool CeremonyRestoreStatic => _ceremonyRestoreStatic?.Value != false;
         internal static TakeoverSoundtrackMode SoundtrackMode => _soundtrackMode?.Value ?? TakeoverSoundtrackMode.Off;
         internal static float SoundtrackVolume => Mathf.Clamp01(_soundtrackVolume?.Value ?? 0.8f);
-        // #662 per-monitor media. Off is the shipped default and must leave the takeover
-        // byte-for-byte as it was: one player, one RenderTexture, one source on every face.
-        internal static bool RandomPerMonitorMedia => _randomPerMonitorMedia?.Value == true;
-        internal static int MaxConcurrentMediaPlayers =>
+        // #662 per-monitor media. A blank list is the shipped default and must leave the
+        // takeover byte-for-byte as it was: one player, one RenderTexture, one source on every
+        // face. #861 folded the separate on/off toggle into the list: non-empty means on.
+        internal static bool PerMonitorMediaConfigured => PerMonitorMediaPool().Length > 0;
+        internal static int MaxVideosAtOnce =>
             Mathf.Clamp(_maxConcurrentMediaPlayers?.Value ?? 3, 1, 6);
         internal static string[] PerMonitorMediaPool() => SplitSemicolonList(_perMonitorMediaPool?.Value);
 
@@ -379,37 +413,37 @@ namespace Y4NGZCompany.Core
                 "Choose configured dialogue from any enabled quota instead of attaching dialogue to its quota.");
             _randomizeWithoutReplacement = config.Bind(MonitorTakeoverConfigSchemaMigration.PresentationSection, "RandomizeWithoutReplacement", true,
                 "When randomizing, use every available passage once before the deterministic pool repeats.");
-            _defaultMediaFile = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "DefaultMediaFile", string.Empty,
-                "Optional PNG, JPG, or MP4 filename in BepInEx/config/Y4NGZCompany/MonitorTakeovers used when a quota has no MediaFile, or a full YouTube link (watch, Shorts, Live, Embed, or youtu.be). Files need an identical copy on every player or that player falls back to the built-in media; a YouTube link is downloaded and cached by each player in the background instead.");
-            _mumbleAudioFiles = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "MumbleAudioFiles", string.Empty,
-                "Comma-separated MP3, WAV, or OGG filenames in BepInEx/config/Y4NGZCompany/MonitorTakeovers that replace the quota takeover's mumble voice clips. Every player in the lobby needs an identical copy or that player falls back to the built-in audio.");
-            _alarmAudioFile = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "AlarmAudioFile", string.Empty,
-                "Single MP3, WAV, or OGG filename in BepInEx/config/Y4NGZCompany/MonitorTakeovers that replaces the quota takeover's alarm sound. Every player in the lobby needs an identical copy or that player falls back to the built-in audio.");
+            // #861: player-readable names. Every description says what the setting layers over or
+            // replaces, because that was the question the old names could not answer.
+            _defaultMediaFile = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "MediaForAllQuotas", string.Empty,
+                "Video (MP4), image (PNG or JPG), or full YouTube link shown on the ship monitors by every quota that leaves its own Media setting blank. Blank shows the built-in Y4NGZ video. Files go in BepInEx/config/Y4NGZCompany/MonitorTakeovers and every player needs an identical copy or they see the built-in video; a YouTube link is downloaded and cached by each player in the background.");
+            _loopMedia = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "LoopVideo", true,
+                "Restart your video from the beginning if it ends before the takeover does.");
+            _enableMediaAudio = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "PlayVideoSound", false,
+                "Play the sound from your own video on top of the takeover's built-in audio (the siren, the drone, and the voice lines). Off by default so it does not talk over the dialogue. The built-in video never plays its own sound, and a playing Soundtrack mutes this.");
+            _useMediaLengthAsDuration = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "HoldForWholeVideo", false,
+                "Keep the monitors taken over until your video finishes instead of for Takeover Duration seconds. Only applies to a video you supply (local MP4 or YouTube link); capped at 30 minutes.");
+            // #662. Born in Media, default blank, so an untouched profile keeps the single-source
+            // takeover exactly as it is. The list is semicolon-separated because a YouTube link
+            // may legally contain a comma, which the other list keys here use as a separator.
+            _perMonitorMediaPool = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "MediaPerMonitor", string.Empty,
+                "Show a different video or image on each ship monitor. Semicolon-separated list of files from BepInEx/config/Y4NGZCompany/MonitorTakeovers and/or full YouTube links (semicolons, because a link can contain a comma). Leave blank for one shared video on every monitor, chosen by the quota's Media setting and MediaForAllQuotas. Files need an identical copy on every player; links are cached by each player. Example: clip1.mp4;https://youtu.be/abc;poster.png");
+            _maxConcurrentMediaPlayers = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "MaxVideosAtOnce", 3,
+                new ConfigDescription(
+                    "How many videos may play at the same time when MediaPerMonitor lists several. Extra monitors repeat the videos already playing. Lower this if per-monitor takeovers stutter.",
+                    new AcceptableValueRange<int>(1, 6)));
+            _mumbleAudioFiles = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "VoiceFiles", string.Empty,
+                "Your own voice clips, replacing the built-in mumbled voice lines that repeat in random order, through the ship-speaker filter, under the typed dialogue. Not synchronized narration: for one whole recording use Soundtrack instead. Full file names with extensions, MP3, WAV or OGG only (no links), separated by commas, so a file name cannot contain a comma. Up to 12 files of at most 32 MiB each, in BepInEx/config/Y4NGZCompany/MonitorTakeovers of the active profile. Global: the same files for every quota. Every player needs an identical copy; a file that is missing, different or unreadable for a player is skipped for them while their other files still play, and they hear the built-in voices only when none of the files is usable.");
+            _alarmAudioFile = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "AlarmFile", string.Empty,
+                "One file that replaces the built-in siren looping from the start of the takeover. Full file name with extension, MP3, WAV or OGG only, at most 32 MiB, in the same folder as VoiceFiles. Global: the same file for every quota. A player without a usable identical copy hears the built-in siren.");
             // #715 takeover soundtrack. Born in Audio; default Off so an untouched profile keeps
             // the built-in bed exactly as it was.
-            _soundtrackSource = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "SoundtrackSource", string.Empty,
-                "Optional MP3, WAV, or OGG filename in BepInEx/config/Y4NGZCompany/MonitorTakeovers, or a full YouTube link, played as the quota takeover's soundtrack. Files need an identical copy on every player; a YouTube link is downloaded and cached by each player in the background. Ignored when SoundtrackMode is Off.");
+            _soundtrackSource = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "Soundtrack", string.Empty,
+                "Music for the whole takeover: a full file name with extension (MP3, WAV or OGG, at most 32 MiB) from BepInEx/config/Y4NGZCompany/MonitorTakeovers of the active profile, or a full YouTube link. It loops for as long as the takeover lasts and never makes the takeover longer. Does nothing while SoundtrackMode is Off. Global: the same soundtrack for every quota. A file needs an identical copy on every player; a link is downloaded and cached by each player.");
             _soundtrackMode = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "SoundtrackMode", TakeoverSoundtrackMode.Off,
-                "Off keeps the built-in takeover audio. Replace silences the power-down whine, the alarm, the drone bed, and the mumble voices for the whole takeover and plays only the soundtrack. Mix layers the soundtrack over them.");
+                "Off: no soundtrack; the takeover audio plays as usual, including your AlarmFile and VoiceFiles. Mix: the Soundtrack plays on top of that audio. Replace: only the Soundtrack plays, and the power-down whine, siren, drone and voice lines are silenced, built-in or your own AlarmFile and VoiceFiles alike. If a Replace soundtrack cannot start or fails while playing, the drone and voice lines return for the rest of that takeover.");
             _soundtrackVolume = config.Bind(MonitorTakeoverConfigSchemaMigration.AudioSection, "SoundtrackVolume", 0.8f,
-                new ConfigDescription("Soundtrack volume (0 = silent, 1 = full). Independent of Mumble Volume.", new AcceptableValueRange<float>(0f, 1f)));
-            _loopMedia = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "LoopMedia", true,
-                "Loop configured MP4 media for the duration of the takeover.");
-            _enableMediaAudio = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "EnableMediaAudio", false,
-                "Play the configured MP4 audio track. Disabled by default so it does not compete with takeover speech.");
-            _useMediaLengthAsDuration = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "UseMediaLengthAsDuration", false,
-                "Hold the takeover for the configured video's full length instead of Takeover Duration. Applies only when the takeover media is a video (local MP4 or YouTube link); clamped to 30 minutes.");
-            // #662. Born in Media, default off, so an untouched profile keeps the single-source
-            // takeover exactly as it is. The pool is semicolon-separated because a YouTube link
-            // may legally contain a comma, which the other list keys here use as a separator.
-            _randomPerMonitorMedia = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "RandomPerMonitorMedia", false,
-                "Play different media on different ship monitors during the quota takeover. Off keeps every monitor on one shared video.");
-            _perMonitorMediaPool = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "PerMonitorMediaPool", string.Empty,
-                "Semicolon-separated list of PNG/JPG/MP4 filenames in BepInEx/config/Y4NGZCompany/MonitorTakeovers and/or full YouTube links used when RandomPerMonitorMedia is on. Empty falls back to the quota's MediaFile and DefaultMediaFile. Files need an identical copy on every player; links are cached by each player. Example: clip1.mp4;https://youtu.be/abc;poster.png");
-            _maxConcurrentMediaPlayers = config.Bind(MonitorTakeoverConfigSchemaMigration.MediaSection, "MaxConcurrentMediaPlayers", 3,
-                new ConfigDescription(
-                    "Maximum simultaneous video decoders during a per-monitor takeover. Extra monitors share the players in a fixed rotation.",
-                    new AcceptableValueRange<int>(1, 6)));
+                new ConfigDescription("Volume of the Soundtrack only (0 = silent, 1 = full). 0 is deliberate silence, so Replace at 0 still silences the takeover audio. Does not affect VoiceVolume or the siren.", new AcceptableValueRange<float>(0f, 1f)));
             _enableUnlockAnnouncement = config.Bind(MonitorTakeoverConfigSchemaMigration.RewardsCeremonySection, "EnableUnlockAnnouncement", true,
                 "After the takeover ends, show the quota's new unlocks and grants on the left large ship monitor.");
             _unlockAnnouncementSeconds = config.Bind(MonitorTakeoverConfigSchemaMigration.RewardsCeremonySection, "UnlockAnnouncementSeconds", 4.5f,
@@ -503,9 +537,10 @@ namespace Y4NGZCompany.Core
             if (_enabled?.Value != true || NetworkManager.Singleton?.IsServer != true) return;
 
             int quota = Math.Max(0, rollover.CompletedQuotaCount);
-            _currentPayload = BuildPayload(quota);
+            _currentPayload = BuildPayload(quota, reportAudio: true);
             _hasCurrentPayload = true;
             SendPayload(_currentPayload);
+            PrepareTakeoverAudio(_currentPayload);
             SendSoundtrack(BuildSoundtrackPlan());
             SendMediaPlan(BuildMediaPlan(_currentPayload));
             ApplyRewardsThroughQuota(quota);
@@ -541,6 +576,8 @@ namespace Y4NGZCompany.Core
                         return IsSuitUnlocked(stableId);
                     case QuotaUnlockCategories.StoreItem:
                         return IsStoreItemUnlocked(stableId);
+                    case QuotaUnlockCategories.Moon:
+                        return IsMoonUnlocked(stableId);
                     // An unknown category gates nothing, matching the contract's rule for an
                     // unknown ID: the configuration lists what is held back, and silence means
                     // "not gated".
@@ -553,6 +590,8 @@ namespace Y4NGZCompany.Core
             {
                 if (category == QuotaUnlockCategories.Constellation)
                     return TryGetConstellationUnlockQuota(stableId, out quota);
+                if (category == QuotaUnlockCategories.Moon)
+                    return TryGetMoonUnlockQuota(stableId, out quota);
 
                 quota = 0;
                 return false;
@@ -576,13 +615,14 @@ namespace Y4NGZCompany.Core
             {
                 _activeSaveName = saveName;
                 _hasCurrentPayload = false;
-                _soundtrackPlan = default;
+                _soundtrackPlan = TakeoverSoundtrackPlanWire.Off;
                 _mediaPlan = default;
                 _hasAuthoritativeUpgradeSnapshot = false;
                 AuthoritativeUnlockedUpgrades.Clear();
                 AuthoritativeConstellationUnlockQuotas.Clear();
                 AuthoritativeSuitUnlockQuotas.Clear();
                 AuthoritativeStoreItemUnlockQuotas.Clear();
+                AuthoritativeMoonUnlockQuotas.Clear();
                 _authoritativeQuota = 0;
                 _cachedLedger = null;
                 _cachedLedgerSave = string.Empty;
@@ -605,6 +645,7 @@ namespace Y4NGZCompany.Core
                     try { _registeredMessaging.UnregisterNamedMessageHandler(GateSnapshotMessage); } catch { }
                     try { _registeredMessaging.UnregisterNamedMessageHandler(SoundtrackMessage); } catch { }
                     try { _registeredMessaging.UnregisterNamedMessageHandler(MediaPlanMessage); } catch { }
+                    try { _registeredMessaging.UnregisterNamedMessageHandler(MoonRulesMessage); } catch { }
                 }
                 if (_registeredNetworkManager != null && _clientConnectedHandler != null)
                 {
@@ -614,11 +655,20 @@ namespace Y4NGZCompany.Core
                 messaging.RegisterNamedMessageHandler(GateSnapshotMessage, OnGateSnapshotMessage);
                 messaging.RegisterNamedMessageHandler(SoundtrackMessage, OnSoundtrackMessage);
                 messaging.RegisterNamedMessageHandler(MediaPlanMessage, OnMediaPlanMessage);
+                messaging.RegisterNamedMessageHandler(MoonRulesMessage, OnMoonRulesMessage);
                 // A new lobby has published nothing yet, and a stale plan from the previous one
                 // would silence this lobby's bed under Replace before any takeover ran.
-                _soundtrackPlan = default;
+                _soundtrackPlan = TakeoverSoundtrackPlanWire.Off;
                 // #662: and would hand this lobby a pool the new host may not even have.
                 _mediaPlan = default;
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+                // #861: nor may the previous lobby's payload, audio loads, selection or decoded
+                // clips carry over: a rejoining client must not prepare or play the last host's
+                // files. Runs before this lobby's handlers can deliver anything, and needs no
+                // live takeover manager.
+                _hasCurrentPayload = false;
+                TakeoverAudioOverrides.Reset("new lobby");
+#endif
                 _clientConnectedHandler = OnClientConnected;
                 try { nm.OnClientConnectedCallback += _clientConnectedHandler; }
                 catch (Exception ex) { _log?.LogWarning($"Quota progression client-connect hook failed: {ex.Message}"); }
@@ -704,9 +754,10 @@ namespace Y4NGZCompany.Core
         {
             if (_enabled?.Value != true || NetworkManager.Singleton?.IsServer != true) return;
             int quota = TimeOfDay.Instance != null ? Math.Max(0, TimeOfDay.Instance.timesFulfilledQuota) : 0;
-            _currentPayload = BuildPayload(quota);
+            _currentPayload = BuildPayload(quota, reportAudio: true);
             _hasCurrentPayload = true;
             SendPayload(_currentPayload);
+            PrepareTakeoverAudio(_currentPayload);
             SendSoundtrack(BuildSoundtrackPlan());
             SendMediaPlan(BuildMediaPlan(_currentPayload));
             ApplyRewardsThroughQuota(quota);
@@ -716,7 +767,7 @@ namespace Y4NGZCompany.Core
         internal static QuotaTakeoverPayload GetCurrentPayload(string[] builtInDialogue)
         {
             int quota = TimeOfDay.Instance != null ? Math.Max(0, TimeOfDay.Instance.timesFulfilledQuota) : 0;
-            QuotaTakeoverPayload payload = _hasCurrentPayload && _currentPayload.Quota == quota ? _currentPayload : BuildPayload(quota);
+            QuotaTakeoverPayload payload = _hasCurrentPayload && _currentPayload.Quota == quota ? _currentPayload : BuildPayload(quota, reportAudio: false);
             if (string.IsNullOrWhiteSpace(payload.Dialogue) && builtInDialogue != null && builtInDialogue.Length > 0)
             {
                 int index = RandomizeDialogue
@@ -730,16 +781,85 @@ namespace Y4NGZCompany.Core
         internal static void PrepareHostTakeoverPayload(string[] builtInDialogue)
         {
             if (NetworkManager.Singleton?.IsServer != true) return;
-            QuotaTakeoverPayload payload = GetCurrentPayload(builtInDialogue);
+            // #861: every new host takeover re-reads AlarmFile and VoiceFiles from the current
+            // config and disk, so a file repaired, replaced or added since the rollover is what
+            // plays. Only the audio fields are rebuilt: the dialogue, the media and the selection
+            // id the rollover fixed are carried over untouched.
+            BuildAudioOverrideFields(true,
+                out string alarmAudio, out string alarmAudioHash,
+                out string mumbleAudio, out string mumbleAudioHashes);
+            QuotaTakeoverPayload payload = GetCurrentPayload(builtInDialogue)
+                .WithAudio(alarmAudio, alarmAudioHash, mumbleAudio, mumbleAudioHashes);
             _currentPayload = payload;
             _hasCurrentPayload = true;
             SendPayload(payload);
+            PrepareTakeoverAudio(payload);
             // Re-sent at the head of every BeginTakeover, which is what covers a late joiner:
             // the sidecar has no snapshot of its own.
             SendSoundtrack(BuildSoundtrackPlan());
             // #662: the seed is rolled here too, so the layout is fixed for the takeover that is
             // about to start rather than carried over from the rollover that armed it.
             SendMediaPlan(BuildMediaPlan(payload));
+        }
+
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+        /// <summary>
+        /// #861. Every peer, at BeginTakeover: makes sure the selection this takeover will read
+        /// is the one being prepared, and restarts any load that was interrupted. The host and
+        /// a client that received the payload were prepared when the selection arrived, so this
+        /// re-hashes nothing for them; a client without a host payload prepares its own
+        /// fallback here.
+        /// </summary>
+        internal static void EnsureTakeoverAudioPrepared(string[] builtInDialogue, MonoBehaviour fallbackOwner)
+        {
+            MonoBehaviour owner = TakeoverAudioOwner();
+            if (owner == null) owner = fallbackOwner;
+            if (owner == null) return;
+
+            QuotaTakeoverPayload payload = GetCurrentPayload(builtInDialogue);
+            if (!TakeoverAudioOverrides.IsPreparedFor(payload))
+                TakeoverAudioOverrides.PreparePayload(owner, payload);
+            if (!TakeoverAudioOverrides.IsPreparedFor(_soundtrackPlan))
+                TakeoverSoundtrack.Prepare(owner, _soundtrackPlan);
+            TakeoverAudioOverrides.EnsureRequested(owner);
+        }
+
+        /// <summary>
+        /// The MonoBehaviour whose GameObject runs audio decodes (on a TakeoverAudioLoader beside
+        /// it): this plugin's own persistent host, or the takeover manager when that host is gone
+        /// or inactive. Null while the presentation is disabled, so a profile with the takeover
+        /// turned off never decodes a file it will never play.
+        /// </summary>
+        private static MonoBehaviour TakeoverAudioOwner()
+        {
+            if (!Y4NGZCompany.Bootstrap.TakeoverBootstrap.PresentationActive) return null;
+            MonoBehaviour host = MonitorTakeoverPlugin.CoroutineHost;
+            if (host != null && host.isActiveAndEnabled) return host;
+            TakeoverManager manager = TakeoverManager.Instance;
+            return manager != null && manager.isActiveAndEnabled ? manager : null;
+        }
+#endif
+
+        /// <summary>
+        /// #861: a takeover's audio starts decoding as soon as this peer knows the selection —
+        /// the host when it builds it, a client when the payload arrives — instead of when the
+        /// takeover begins.
+        /// </summary>
+        private static void PrepareTakeoverAudio(QuotaTakeoverPayload payload)
+        {
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            MonoBehaviour owner = TakeoverAudioOwner();
+            if (owner != null) TakeoverAudioOverrides.PreparePayload(owner, payload);
+#endif
+        }
+
+        /// <summary>#861: the soundtrack's local file, prepared like the payload's audio.</summary>
+        private static void PrepareTakeoverSoundtrack(TakeoverSoundtrackPlanWire plan)
+        {
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            MonoBehaviour owner = TakeoverAudioOwner();
+            if (owner != null) TakeoverSoundtrack.Prepare(owner, plan);
+#endif
         }
 
         // -- Neutral unlock gates (#611 task 1.3) -----------------------------
@@ -791,6 +911,47 @@ namespace Y4NGZCompany.Core
             return IsRuleUnlocked(name, AuthoritativeStoreItemUnlockQuotas, milestone => milestone.StoreItems);
         }
 
+        // -- Moon unlocks (#862) ------------------------------------------------
+        // Keyed like suits and store items: a rule string of name=quota pairs the host
+        // publishes, a client-side authoritative copy, and the local milestone config on the
+        // host. The name is the moon as the terminal shows it; MoonKey strips vanilla's
+        // numeric prefix so "8-Titan", "8 Titan" and "Titan" are one moon.
+
+        internal static bool IsMoonUnlocked(string planetName)
+        {
+            return IsRuleUnlocked(MoonKey(planetName), AuthoritativeMoonUnlockQuotas, milestone => milestone.Moons.Select(MoonKey));
+        }
+
+        internal static bool TryGetMoonUnlockQuota(string planetName, out int quota)
+        {
+            quota = 0;
+            string key = MoonKey(planetName);
+            if (_enabled?.Value != true || string.IsNullOrWhiteSpace(key)) return false;
+            if (NetworkManager.Singleton != null && !NetworkManager.Singleton.IsServer && _hasAuthoritativeUpgradeSnapshot)
+                return AuthoritativeMoonUnlockQuotas.TryGetValue(Normalize(key), out quota);
+            foreach (QuotaMilestoneConfig milestone in Milestones.Values.Where(m => m.Enable.Value).OrderBy(m => m.Quota))
+            {
+                if (!milestone.Moons.Any(item => Normalize(MoonKey(item)) == Normalize(key))) continue;
+                quota = milestone.Quota;
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// A moon name without vanilla's "41-" / "8 " numeric prefix. Only a prefix of digits
+        /// followed by a separator is stripped, so a moon that is literally named "5" survives.
+        /// </summary>
+        internal static string MoonKey(string planetName)
+        {
+            string value = (planetName ?? string.Empty).Trim();
+            int digits = 0;
+            while (digits < value.Length && char.IsDigit(value[digits])) digits++;
+            if (digits > 0 && digits < value.Length && (value[digits] == '-' || value[digits] == ' ' || value[digits] == '_'))
+                value = value.Substring(digits + 1);
+            return value.Trim();
+        }
+
         private static bool IsRuleUnlocked(string name, Dictionary<string, int> authoritative, Func<QuotaMilestoneConfig, IEnumerable<string>> selector)
         {
             if (_enabled?.Value != true || string.IsNullOrWhiteSpace(name)) return true;
@@ -807,6 +968,7 @@ namespace Y4NGZCompany.Core
             internal IReadOnlyList<string> Contracts;
             internal IReadOnlyList<string> ShipUpgrades;
             internal IReadOnlyList<string> Constellations;
+            internal IReadOnlyList<string> Moons;
             internal IReadOnlyList<string> Suits;
             internal IReadOnlyList<string> StoreItems;
             internal int TokensPerPlayer;
@@ -824,6 +986,7 @@ namespace Y4NGZCompany.Core
                 Contracts = milestone.Contracts.ToArray(),
                 ShipUpgrades = milestone.Upgrades.ToArray(),
                 Constellations = milestone.Constellations.ToArray(),
+                Moons = milestone.Moons.ToArray(),
                 Suits = milestone.Suits.ToArray(),
                 StoreItems = milestone.StoreItems.ToArray(),
                 TokensPerPlayer = milestone.GrantTokensPerPlayer.Value,
@@ -847,7 +1010,10 @@ namespace Y4NGZCompany.Core
             return !required.HasValue || completedQuotas >= required.Value;
         }
 
-        private static QuotaTakeoverPayload BuildPayload(int quota)
+        // reportAudio: true only where the host publishes its selection (rollover, the debug
+        // completion, a new takeover), so the audio diagnostics appear once per preparation and
+        // not on every GetCurrentPayload fallback.
+        private static QuotaTakeoverPayload BuildPayload(int quota, bool reportAudio)
         {
             QuotaMilestoneConfig selected = Milestones.TryGetValue(quota, out QuotaMilestoneConfig exact) && exact.Enable.Value ? exact : null;
             List<QuotaMilestoneConfig> dialoguePool = Milestones.Values
@@ -870,7 +1036,7 @@ namespace Y4NGZCompany.Core
             YoutubeVideoResolver.Prefetch(media);
             string mediaHash = !YoutubeVideoResolver.IsYoutubeUrl(media)
                 && TryResolveMediaFile(media, out string mediaPath) ? ComputeSha256(mediaPath) : string.Empty;
-            BuildAudioOverrideFields(
+            BuildAudioOverrideFields(reportAudio,
                 out string alarmAudio, out string alarmAudioHash,
                 out string mumbleAudio, out string mumbleAudioHashes);
             return new QuotaTakeoverPayload(quota, dialogue, media, mediaHash, selected?.Quota ?? 0,
@@ -879,41 +1045,36 @@ namespace Y4NGZCompany.Core
 
         // Host-side only: an override is published solely when this machine can
         // resolve and hash the file, so a client never receives a name with an
-        // empty hash it would have to trust blindly.
-        private static void BuildAudioOverrideFields(
+        // empty hash it would have to trust blindly. #861: TakeoverAudioPolicy decides, and a
+        // name too long for its field is rejected rather than truncated into another file.
+        private static void BuildAudioOverrideFields(bool report,
             out string alarmAudio, out string alarmAudioHash,
             out string mumbleAudio, out string mumbleAudioHashes)
         {
-            alarmAudio = string.Empty;
-            alarmAudioHash = string.Empty;
-            string configuredAlarm = TruncateFixed((_alarmAudioFile?.Value ?? string.Empty).Trim(), MaxOverrideFileNameChars);
-            if (configuredAlarm.Length > 0 && TryResolveAudioFile(configuredAlarm, out string alarmPath))
-            {
-                string hash = ComputeSha256(alarmPath);
-                if (hash.Length > 0) { alarmAudio = configuredAlarm; alarmAudioHash = hash; }
-            }
+            string root = MediaDirectory;
+            TakeoverAudioFileCheck alarm = TakeoverAudioPolicy.CheckHostFile(root, "AlarmFile", _alarmAudioFile?.Value);
+            alarmAudio = alarm.Accepted ? alarm.Name : string.Empty;
+            alarmAudioHash = alarm.Accepted ? alarm.Hash : string.Empty;
 
-            var names = new List<string>();
-            var hashes = new List<string>();
-            int nameChars = 0;
-            int hashChars = 0;
-            foreach (string entry in SplitList(_mumbleAudioFiles?.Value))
+            TakeoverVoiceSelection voices = TakeoverAudioPolicy.SelectHostVoices(root, _mumbleAudioFiles?.Value);
+            mumbleAudio = voices.Names;
+            mumbleAudioHashes = voices.Hashes;
+
+            if (!report) return;
+            if (!alarm.Accepted && alarm.Status != TakeoverAudioFileStatus.Blank)
+                _log?.LogWarning("[QuotaProgression] " + alarm.Describe("it is not sent to players, so everyone hears the built-in siren"));
+            for (int index = 0; index < voices.Rejected.Count; index++)
             {
-                if (names.Count >= MaxMumbleOverrideClips) break;
-                string name = TruncateFixed(entry, MaxOverrideFileNameChars);
-                if (!TryResolveAudioFile(name, out string clipPath)) continue;
-                string hash = ComputeSha256(clipPath);
-                if (hash.Length == 0) continue;
-                int nextNameChars = nameChars + name.Length + (names.Count > 0 ? 1 : 0);
-                int nextHashChars = hashChars + hash.Length + (hashes.Count > 0 ? 1 : 0);
-                if (nextNameChars > MaxMumbleOverrideNameChars || nextHashChars > MaxMumbleOverrideHashChars) break;
-                names.Add(name);
-                hashes.Add(hash);
-                nameChars = nextNameChars;
-                hashChars = nextHashChars;
+                _log?.LogWarning("[QuotaProgression] " + voices.Rejected[index].Describe(voices.Accepted.Count > 0
+                    ? $"it is not sent to players; the other {voices.Accepted.Count} voice file(s) still play"
+                    : "it is not sent to players, and with no usable voice file everyone hears the built-in voices"));
             }
-            mumbleAudio = string.Join(",", names);
-            mumbleAudioHashes = string.Join(",", hashes);
+            if (alarm.Accepted || voices.Accepted.Count > 0)
+            {
+                _log?.LogInfo(
+                    $"[QuotaProgression] Takeover audio published: AlarmFile {(alarm.Accepted ? "'" + alarm.Name + "'" : "built-in")}, "
+                    + $"VoiceFiles {voices.Accepted.Count} file(s){(voices.Accepted.Count > 0 ? " '" + voices.Names + "'" : string.Empty)}.");
+            }
         }
 
         private static string ReadDialogue(QuotaMilestoneConfig milestone)
@@ -950,16 +1111,6 @@ namespace Y4NGZCompany.Core
             return TryResolveVerifiedFile(configured, MediaExtensions, expectedHash, "media", out path);
         }
 
-        internal static bool TryResolveAudioFile(string configured, out string path)
-        {
-            return TryResolveFile(configured, AudioExtensions, out path);
-        }
-
-        internal static bool TryResolveAudioFile(string configured, string expectedHash, out string path)
-        {
-            return TryResolveVerifiedFile(configured, AudioExtensions, expectedHash, "audio", out path);
-        }
-
         private static bool TryResolveVerifiedFile(string configured, string[] extensions, string expectedHash, string kind, out string path)
         {
             if (!TryResolveFile(configured, extensions, out path)) return false;
@@ -976,15 +1127,15 @@ namespace Y4NGZCompany.Core
         private static bool TryResolveFile(string configured, string[] extensions, out string path)
         {
             path = null;
-            if (string.IsNullOrWhiteSpace(configured)) return false;
-            string root = Path.GetFullPath(MediaDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-            string candidate = Path.GetFullPath(Path.Combine(root, configured.Trim()));
-            if (!candidate.StartsWith(root, StringComparison.OrdinalIgnoreCase) || !File.Exists(candidate)) return false;
-            if (!extensions.Contains(Path.GetExtension(candidate), StringComparer.OrdinalIgnoreCase)) return false;
+            // #861: the same sandbox the takeover audio files use, which contains a malformed
+            // name or an IO failure as a rejection instead of throwing out of BuildPayload.
+            if (TakeoverAudioPolicy.TryLocate(MediaDirectory, configured, extensions,
+                    out string candidate, out long length, out _) != TakeoverAudioFileStatus.Accepted)
+                return false;
             long maxBytes = Path.GetExtension(candidate).Equals(".mp4", StringComparison.OrdinalIgnoreCase)
                 ? 512L * 1024L * 1024L
                 : 32L * 1024L * 1024L;
-            if (new FileInfo(candidate).Length > maxBytes)
+            if (length > maxBytes)
             {
                 _log?.LogWarning($"Configured takeover media '{Path.GetFileName(candidate)}' exceeds the size limit.");
                 return false;
@@ -994,43 +1145,11 @@ namespace Y4NGZCompany.Core
         }
 
         // ── Loose-file takeover audio overrides ───────────────────────────────
-        // Same sandbox as the image/video override: names resolve inside the
-        // takeover media directory only, and a client accepts a file only when
-        // its SHA-256 matches the hash the host published with the payload.
+        // #861: resolution, sandboxing, size and hash rules for AlarmFile, VoiceFiles and a
+        // local Soundtrack live in TakeoverAudioPolicy, shared by the host's publish and every
+        // client's acceptance. TakeoverAudioOverrides turns the accepted files into clips.
 
-        internal static TakeoverAudioOverrideFile ResolveTakeoverAlarmAudio(QuotaTakeoverPayload payload)
-        {
-            if (string.IsNullOrWhiteSpace(payload.AlarmAudioFile)) return default;
-            if (TryResolveAudioFile(payload.AlarmAudioFile, payload.AlarmAudioHash, out string path))
-                return new TakeoverAudioOverrideFile(path, payload.AlarmAudioHash);
-            _log?.LogWarning($"Takeover alarm audio override '{payload.AlarmAudioFile}' is missing or does not match the host copy; using the built-in alarm.");
-            return default;
-        }
-
-        internal static List<TakeoverAudioOverrideFile> ResolveTakeoverMumbleAudio(QuotaTakeoverPayload payload)
-        {
-            var resolved = new List<TakeoverAudioOverrideFile>();
-            string[] names = SplitList(payload.MumbleAudioFiles);
-            string[] hashes = SplitList(payload.MumbleAudioHashes);
-            if (names.Length == 0) return resolved;
-            int rejected = 0;
-            for (int index = 0; index < names.Length; index++)
-            {
-                string hash = index < hashes.Length ? hashes[index] : string.Empty;
-                if (TryResolveAudioFile(names[index], hash, out string path))
-                    resolved.Add(new TakeoverAudioOverrideFile(path, hash));
-                else rejected++;
-            }
-            if (rejected > 0)
-                _log?.LogWarning($"{rejected} of {names.Length} takeover mumble audio overrides are missing or do not match the host copies; those slots use the built-in clips.");
-            return resolved;
-        }
-
-        private static string[] SplitList(string value) => (value ?? string.Empty)
-            .Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(item => item.Trim())
-            .Where(item => item.Length > 0)
-            .ToArray();
+        private static string[] SplitList(string value) => TakeoverAudioPolicy.SplitList(value);
 
         /// <summary>
         /// The per-monitor pool separator (#662). Semicolon, not comma: a YouTube link may
@@ -1066,7 +1185,7 @@ namespace Y4NGZCompany.Core
             if (configured.IndexOf(';') >= 0 || configured.IndexOf(',') < 0) return;
             if (SplitList(configured).Length < 2) return;
             _log?.LogWarning(
-                "[QuotaProgression] PerMonitorMediaPool looks comma-separated; this key uses ';' so that a "
+                "[QuotaProgression] MediaPerMonitor looks comma-separated; this key uses ';' so that a "
                 + "YouTube link containing a comma stays intact. The whole value is being read as one entry.");
         }
 
@@ -1283,6 +1402,10 @@ namespace Y4NGZCompany.Core
             // Kick off the background download now so a first-time YouTube link has
             // the whole quota cycle to cache before its takeover plays (#661).
             YoutubeVideoResolver.Prefetch(_currentPayload.MediaFile);
+            // #861: and start verifying and decoding the host's audio selection now, not at
+            // BeginTakeover. The host prepared its own copy when it built the payload.
+            if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer)
+                PrepareTakeoverAudio(_currentPayload);
         }
 
         // ── Takeover soundtrack sidecar (#715) ────────────────────────────────
@@ -1304,7 +1427,7 @@ namespace Y4NGZCompany.Core
             TakeoverSoundtrackMode mode = SoundtrackMode;
             string configured = (_soundtrackSource?.Value ?? string.Empty).Trim();
             if (mode == TakeoverSoundtrackMode.Off || configured.Length == 0)
-                return default;
+                return TakeoverSoundtrackPlanWire.Off;
 
             float volume = SoundtrackVolume;
             if (YoutubeVideoResolver.IsYoutubeUrl(configured))
@@ -1317,17 +1440,15 @@ namespace Y4NGZCompany.Core
                     mode, TruncateFixed(normalized, MaxYoutubeUrlChars), string.Empty, volume);
             }
 
-            string name = TruncateFixed(configured, MaxOverrideFileNameChars);
-            if (TryResolveAudioFile(name, out string path))
-            {
-                string hash = ComputeSha256(path);
-                if (hash.Length > 0)
-                    return new TakeoverSoundtrackPlanWire(mode, name, hash, volume);
-            }
+            // #861: the same host check as AlarmFile and VoiceFiles. A name too long for the
+            // field is rejected, never truncated into the name of some other file.
+            TakeoverAudioFileCheck check = TakeoverAudioPolicy.CheckHostFile(MediaDirectory, "Soundtrack", configured);
+            if (check.Accepted)
+                return new TakeoverSoundtrackPlanWire(mode, check.Name, check.Hash, volume);
 
-            _log?.LogWarning(
-                $"[QuotaProgression] Takeover soundtrack '{name}' is missing or unreadable on the host; the takeover uses the built-in audio.");
-            return default;
+            _log?.LogWarning("[QuotaProgression] "
+                + check.Describe("it is not sent to players and this takeover plays no soundtrack"));
+            return TakeoverSoundtrackPlanWire.Off;
         }
 
         private static void SendSoundtrack(TakeoverSoundtrackPlanWire plan)
@@ -1335,6 +1456,8 @@ namespace Y4NGZCompany.Core
             // The host plays from the same struct it publishes, so a host-only failure is
             // reflected on the host's own screen rather than only on the clients'.
             _soundtrackPlan = plan;
+            // #861: the host starts decoding a local soundtrack the moment it publishes it.
+            PrepareTakeoverSoundtrack(plan);
             CustomMessagingManager manager = NetworkManager.Singleton?.CustomMessagingManager;
             if (manager == null) return;
             using (var writer = new FastBufferWriter(2048, Allocator.Temp))
@@ -1342,7 +1465,9 @@ namespace Y4NGZCompany.Core
                 writer.WriteValueSafe((int)plan.Mode);
                 FixedString512Bytes source = TruncateFixed(plan.Source,
                     YoutubeVideoResolver.IsYoutubeUrl(plan.Source) ? MaxYoutubeUrlChars : MaxOverrideFileNameChars);
-                FixedString128Bytes hash = plan.Hash;
+                // #782: a null here is a NullReferenceException inside FixedString128Bytes(string),
+                // and a plan built with `default` rather than the constructor carries one.
+                FixedString128Bytes hash = plan.Hash ?? string.Empty;
                 writer.WriteValueSafe(source);
                 writer.WriteValueSafe(hash);
                 writer.WriteValueSafe(plan.Volume);
@@ -1368,6 +1493,9 @@ namespace Y4NGZCompany.Core
             // Same reason the media link prefetches here: the whole quota cycle is headroom
             // for a first-time download.
             YoutubeVideoResolver.Prefetch(_soundtrackPlan.Source);
+            // #861: a local soundtrack file is verified and decoded from here, like the payload.
+            if (NetworkManager.Singleton == null || !NetworkManager.Singleton.IsServer)
+                PrepareTakeoverSoundtrack(_soundtrackPlan);
         }
 
         // ── Per-monitor media plan sidecar (#662) ─────────────────────────────
@@ -1375,7 +1503,7 @@ namespace Y4NGZCompany.Core
         /// <summary>
         /// The per-monitor media plan the current peer should use. An empty pool until the host
         /// publishes one, which is also what an old host that never sends the sidecar leaves in
-        /// place — and what <c>RandomPerMonitorMedia = false</c> publishes.
+        /// place — and what a blank <c>MediaPerMonitor</c> publishes.
         /// </summary>
         internal static TakeoverMediaPlanWire GetMediaPlan() => _mediaPlan;
 
@@ -1389,10 +1517,10 @@ namespace Y4NGZCompany.Core
         /// </summary>
         private static TakeoverMediaPlanWire BuildMediaPlan(QuotaTakeoverPayload payload)
         {
-            if (!RandomPerMonitorMedia) return default;
+            if (!PerMonitorMediaConfigured) return default;
 
             int seed = UnityEngine.Random.Range(int.MinValue, int.MaxValue);
-            int maxPlayers = MaxConcurrentMediaPlayers;
+            int maxPlayers = MaxVideosAtOnce;
             var names = new List<string>();
             var hashes = new List<string>();
             int nameChars = 0;
@@ -1505,7 +1633,38 @@ namespace Y4NGZCompany.Core
                 writer.WriteValueSafe(storeItemValues);
                 manager.SendNamedMessageToAll(GateSnapshotMessage, writer);
             }
+            SendMoonRules(manager, quota);
             QuotaProgressionSuitGate.OnUnlockStateMaybeChanged(quota);
+        }
+
+        /// <summary>
+        /// #862. Sent beside every gate snapshot, in its own message, so the snapshot's frozen
+        /// four-field layout stays readable by every 1.x peer. Same rule-string shape as the
+        /// suit and store-item rules; a client that never registered the handler keeps an empty
+        /// authoritative map and gates nothing locally, which is exactly the pre-#862 client.
+        /// </summary>
+        private static void SendMoonRules(CustomMessagingManager manager, int quota)
+        {
+            if (manager == null) return;
+            string moonRules = BuildRuleString(milestone => milestone.Moons.Select(MoonKey));
+            using (var writer = new FastBufferWriter(4608, Allocator.Temp))
+            {
+                writer.WriteValueSafe(quota);
+                FixedString4096Bytes moonValues = TruncateFixed(moonRules, 1000);
+                writer.WriteValueSafe(moonValues);
+                manager.SendNamedMessageToAll(MoonRulesMessage, writer);
+            }
+        }
+
+        private static void OnMoonRulesMessage(ulong sender, FastBufferReader reader)
+        {
+            if (sender != NetworkManager.ServerClientId) return;
+            reader.ReadValueSafe(out int quota);
+            reader.ReadValueSafe(out FixedString4096Bytes moonValues);
+            ParseRuleString(moonValues.ToString(), AuthoritativeMoonUnlockQuotas);
+            // The snapshot that travelled just before this already set the authoritative quota;
+            // taking the max keeps a reordered pair from moving it backwards.
+            _authoritativeQuota = Math.Max(_authoritativeQuota, Math.Max(0, quota));
         }
 
         private static string BuildRuleString(Func<QuotaMilestoneConfig, IEnumerable<string>> selector)
@@ -1567,7 +1726,7 @@ namespace Y4NGZCompany.Core
                 string path = Y4NGZCompanyPaths.LocalDataFile("quota-progression-effective.tsv");
                 var lines = new List<string>
                 {
-                    "quota\tenabled\tdialogue\tmedia\tcontracts\tupgrades\tconstellations\tsuits\tstore_items\ttokens_per_player\tgroup_credits\tship_fuel"
+                    "quota\tenabled\tdialogue\tmedia\tcontracts\tupgrades\tconstellations\tmoons\tsuits\tstore_items\ttokens_per_player\tgroup_credits\tship_fuel"
                 };
                 foreach (QuotaMilestoneConfig milestone in Milestones.Values.OrderBy(m => m.Quota))
                 {
@@ -1583,6 +1742,7 @@ namespace Y4NGZCompany.Core
                         EscapeAudit(string.Join(",", milestone.Contracts)),
                         EscapeAudit(string.Join(",", milestone.Upgrades)),
                         EscapeAudit(string.Join(",", milestone.Constellations)),
+                        EscapeAudit(string.Join(",", milestone.Moons)),
                         EscapeAudit(string.Join(",", milestone.Suits)),
                         EscapeAudit(string.Join(",", milestone.StoreItems)),
                         milestone.GrantTokensPerPlayer.Value.ToString(),
@@ -1594,15 +1754,14 @@ namespace Y4NGZCompany.Core
                 // milestone table as a second two-column block.
                 lines.Add(string.Empty);
                 lines.Add("shared_key\tvalue");
-                lines.Add("DefaultMediaFile\t" + EscapeAudit(_defaultMediaFile?.Value));
-                lines.Add("MumbleAudioFiles\t" + EscapeAudit(_mumbleAudioFiles?.Value));
-                lines.Add("AlarmAudioFile\t" + EscapeAudit(_alarmAudioFile?.Value));
-                lines.Add("SoundtrackSource\t" + EscapeAudit(_soundtrackSource?.Value));
+                lines.Add("MediaForAllQuotas\t" + EscapeAudit(_defaultMediaFile?.Value));
+                lines.Add("VoiceFiles\t" + EscapeAudit(_mumbleAudioFiles?.Value));
+                lines.Add("AlarmFile\t" + EscapeAudit(_alarmAudioFile?.Value));
+                lines.Add("Soundtrack\t" + EscapeAudit(_soundtrackSource?.Value));
                 lines.Add("SoundtrackMode\t" + SoundtrackMode);
                 lines.Add("SoundtrackVolume\t" + SoundtrackVolume.ToString(System.Globalization.CultureInfo.InvariantCulture));
-                lines.Add("RandomPerMonitorMedia\t" + RandomPerMonitorMedia);
-                lines.Add("PerMonitorMediaPool\t" + EscapeAudit(_perMonitorMediaPool?.Value));
-                lines.Add("MaxConcurrentMediaPlayers\t" + MaxConcurrentMediaPlayers);
+                lines.Add("MediaPerMonitor\t" + EscapeAudit(_perMonitorMediaPool?.Value));
+                lines.Add("MaxVideosAtOnce\t" + MaxVideosAtOnce);
                 File.WriteAllLines(path, lines);
                 _log?.LogInfo($"Quota progression effective audit written to '{path}' ({Milestones.Count} milestones).");
             }
@@ -1635,15 +1794,8 @@ namespace Y4NGZCompany.Core
             return order[Math.Max(0, quota - 1) % count];
         }
 
-        private static string ComputeSha256(string path)
-        {
-            try
-            {
-                using (SHA256 sha = SHA256.Create())
-                using (FileStream stream = File.OpenRead(path))
-                    return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", string.Empty).ToLowerInvariant();
-            }
-            catch { return string.Empty; }
-        }
+        // One SHA-256 for media and audio alike (#861), so a host and a client can never hash
+        // the same bytes two different ways.
+        private static string ComputeSha256(string path) => TakeoverAudioPolicy.ComputeSha256(path, out _);
     }
 }

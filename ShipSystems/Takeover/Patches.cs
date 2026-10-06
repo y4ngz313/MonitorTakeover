@@ -7,7 +7,7 @@
 //       QuotaRolloverPublisher already publishes from.
 //   1b. TimeOfDay.SyncNewProfitQuotaClientRpc postfix → every peer. Deliberately still a
 //       patch: the Core event is host-only and not networked, so this is the only thing
-//       giving a client the takeover/MaskMan flags at all.
+//       giving a client the takeover flag at all.
 //
 // Harmony patches:
 //   2. StartOfRound.SetShipReadyToLand → trigger takeover if a flag is set
@@ -72,8 +72,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         //
         // Leg 1b below is NOT converged and must not be: QuotaRolloverFinalized is host-only
         // and not networked, so it is the only thing that gives a non-host peer any of this
-        // state. Deleting it would silently remove the takeover, Mask Man and the finale for
-        // every client in the lobby.
+        // state. Deleting it would silently remove the takeover for every client in the lobby.
         internal static void OnQuotaRolloverFinalized(QuotaRolloverFinalized rollover)
         {
             HandleQuotaRollover("server");
@@ -142,57 +141,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 
             QuotaTakeoverHandoff.QuotaJustCompleted = true;
             TakeoverBootstrap.Log.LogInfo($"[LGUMonitorTakeover] Quota fulfilled ({source}) — takeover queued.");
-            CheckMaskManTrigger(source);
-        }
-
-        // Shared quota-3 check used by both the host postfix and the client-RPC
-        // postfix so host and clients converge on the same MaskManPending state.
-        // SetNewProfitQuota fires AFTER timesFulfilledQuota has incremented for
-        // the just-completed quota, so == 3 is the value we want. If the first
-        // test shows this is off-by-one in the live build, flip to == 2.
-        //
-        // Persistence is per-save via ES3 under the key "Y4NGZ_MaskManFired",
-        // scoped to GameNetworkManager.Instance.currentSaveFileName so each save
-        // file gets its own first-time trigger.
-        private static void CheckMaskManTrigger(string source)
-        {
-            try
-            {
-                var tod = TimeOfDay.Instance;
-                int fulfilled = tod != null ? tod.timesFulfilledQuota : -1;
-
-                bool alreadyFired = false;
-                try
-                {
-                    var saveName = GameNetworkManager.Instance?.currentSaveFileName;
-                    if (!string.IsNullOrEmpty(saveName))
-                    {
-                        alreadyFired = ES3.Load<bool>(QuotaSaveKeys.MaskManFired, saveName, defaultValue: false);
-                    }
-                }
-                catch (System.Exception ex)
-                {
-                    TakeoverBootstrap.Log.LogWarning(
-                        $"[LGUMonitorTakeover] Failed to read Y4NGZ_MaskManFired from save: {ex.Message}");
-                }
-
-                TakeoverBootstrap.Log.LogInfo(
-                    $"[LGUMonitorTakeover] MaskMan check ({source}): timesFulfilledQuota={fulfilled} " +
-                    $"alreadyFiredThisSave={alreadyFired}");
-
-                if (tod != null && fulfilled == 3 && !alreadyFired)
-                {
-                    QuotaTakeoverHandoff.MaskManPending = true;
-                    QuotaTakeoverHandoff.QuotaJustCompleted = false; // suppress normal Y4NGZ this orbit
-                    TakeoverBootstrap.Log.LogInfo(
-                        "[LGUMonitorTakeover] Quota 3 completed — Mask Man takeover queued (one-shot per save). " +
-                        "Y4NGZ takeover suppressed for this orbit.");
-                }
-            }
-            catch (System.Exception ex)
-            {
-                TakeoverBootstrap.Log.LogWarning($"[LGUMonitorTakeover] CheckMaskManTrigger ({source}) failed: {ex.Message}");
-            }
         }
 
         // ── Patch 2: Orbit return → launch takeover ───────────────────────────
@@ -224,20 +172,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             bool skipOrbitDelay = false,
             bool debugForced = false)
         {
-            if (QuotaTakeoverHandoff.MaskManPending)
-            {
-                QuotaTakeoverHandoff.MaskManPending = false;
-                TakeoverManager.EnsureInstance();
-                if (TakeoverManager.Instance == null)
-                    return false;
-
-                TakeoverBootstrap.Log.LogInfo("[LGUMonitorTakeover] Starting MASK MAN takeover.");
-                TakeoverManager.Instance.BeginMaskManTakeover(
-                    skipOrbitDelay,
-                    persistCompletion: !debugForced);
-                return true;
-            }
-
             if (!QuotaTakeoverHandoff.QuotaJustCompleted)
                 return false;
             QuotaTakeoverHandoff.QuotaJustCompleted = false;
@@ -267,6 +201,10 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             TakeoverMonitorOwnership.ResetForNewSession("disconnect");
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
             QuotaTakeoverDebugController.ResetPending();
+            // #861: after ForceRestore released the takeover's captured clips. Aborts and
+            // disposes every in-flight audio load and forgets this session's selection, whether
+            // or not a takeover manager exists.
+            TakeoverAudioOverrides.Reset("disconnect");
 #endif
         }
 

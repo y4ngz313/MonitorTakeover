@@ -12,7 +12,7 @@
          Y4NGZCompany keeps the two in step. -->
     <RootNamespace>Y4NGZCompany</RootNamespace>
     <Description>Y4NGZ monitor takeover: the quota milestone registry and its rewards, milestone unlock gating, the quota announcement, the monitor takeover presentation, and Mask Man</Description>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <!-- Same symbol Y4NGZCompany and Y4NGZShipSystems define. TakeoverAudioOverrides.cs,
          QuotaTakeoverDebugController.cs and the quota-progression payload path all contain #if
          blocks gated on it, so omitting it here would silently compile a DIFFERENT Monitor

@@ -34,7 +34,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 
             // #714: second, and only ever second. The importer above appends values into the
             // PLAIN sections this build binds, so a pre-split profile is already in the new
-            // layout by the time this runs and only receives the schema stamp. A profile that
+            // layout by the time this runs and receives the schema stamp plus the #861 key
+            // renames (the importer's map still speaks the v1 key names). A profile that
             // ran an older split build still has the numbered sections in the destination; the
             // importer refuses to touch it (its own stamp is present) and this pass moves the
             // values across, drops the numbered sections, and backs the old file up.

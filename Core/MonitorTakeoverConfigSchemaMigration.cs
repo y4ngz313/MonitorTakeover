@@ -36,10 +36,17 @@ namespace Y4NGZCompany.ShipSystems.Takeover
     /// file to itself. The two therefore never write the same definition on the same launch, and
     /// the "an existing new-layout value wins" rule below is never the arbiter of a live value.
     /// </para>
+    ///
+    /// <para><b>Schema v2 (#861).</b> The media and audio keys were renamed to names a modpack
+    /// author can read without the source (<c>MumbleAudioFiles</c> became <c>VoiceFiles</c>,
+    /// <c>EnableMediaAudio</c> became <c>PlayVideoSound</c>, and so on), the per-monitor on/off
+    /// toggle folded into the <c>MediaPerMonitor</c> list, and the retired Mask Man key was
+    /// dropped. The rename pass runs on the plain-section dictionary AFTER the numbered sections
+    /// have been lifted, so a v0 file and a v1 file go through one table.</para>
     /// </summary>
     internal static class MonitorTakeoverConfigSchemaMigration
     {
-        internal const int CurrentSchemaVersion = 1;
+        internal const int CurrentSchemaVersion = 2;
 
         // Mirrors src/Y4NGZCompany/Core/Y4NGZCompanyConfigMigration.cs so the two generated
         // config files carry the same stamp under the same heading and read alike.
@@ -59,6 +66,56 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         internal const string LegacyPresentationSection = "72 - Monitor Takeover - Presentation";
         internal const string LegacyEndingSection = "73 - Monitor Takeover - Ending";
         internal const string LegacyDiagnosticsSection = "79 - Monitor Takeover - Diagnostics";
+
+        /// <summary>Bound until #860 removed the Mask Man takeover; dropped on migration.</summary>
+        internal const string RetiredMaskManTailBufferKey = "Mask Man Tail Buffer";
+
+        /// <summary>
+        /// Schema v2 (#861): (section, old key, new key). Applied to the plain-section values,
+        /// so a v0 profile's numbered keys are lifted by <see cref="MapNumbered"/> first and
+        /// renamed second, through this one table. A value already sitting under the new name
+        /// wins and the old key is dropped, matching the section-lift rule above.
+        /// </summary>
+        private static readonly KeyRename[] SchemaV2KeyRenames =
+        {
+            new KeyRename(MediaSection, "DefaultMediaFile", "MediaForAllQuotas"),
+            new KeyRename(MediaSection, "LoopMedia", "LoopVideo"),
+            new KeyRename(MediaSection, "EnableMediaAudio", "PlayVideoSound"),
+            new KeyRename(MediaSection, "UseMediaLengthAsDuration", "HoldForWholeVideo"),
+            new KeyRename(MediaSection, "MaxConcurrentMediaPlayers", "MaxVideosAtOnce"),
+            new KeyRename(AudioSection, "Mumble Volume", "VoiceVolume"),
+            new KeyRename(AudioSection, "MumbleAudioFiles", "VoiceFiles"),
+            new KeyRename(AudioSection, "AlarmAudioFile", "AlarmFile"),
+            new KeyRename(AudioSection, "SoundtrackSource", "Soundtrack"),
+        };
+
+        /// <summary>Per-quota <c>MediaFile</c> became <c>Media</c> in schema v2.</summary>
+        private const string RetiredQuotaMediaFileKey = "MediaFile";
+        private const string QuotaMediaKey = "Media";
+
+        /// <summary>
+        /// Schema v2 folded the v1 pair <c>RandomPerMonitorMedia</c> (bool) plus
+        /// <c>PerMonitorMediaPool</c> (list) into the single <c>MediaPerMonitor</c> list, where
+        /// non-empty means on. A v1 profile whose toggle was off keeps the takeover it had: the
+        /// pool text is not carried, because carrying it would switch the feature on.
+        /// </summary>
+        private const string RetiredRandomPerMonitorMediaKey = "RandomPerMonitorMedia";
+        private const string RetiredPerMonitorMediaPoolKey = "PerMonitorMediaPool";
+        private const string MediaPerMonitorKey = "MediaPerMonitor";
+
+        private readonly struct KeyRename
+        {
+            internal readonly string Section;
+            internal readonly string OldKey;
+            internal readonly string NewKey;
+
+            internal KeyRename(string section, string oldKey, string newKey)
+            {
+                Section = section;
+                OldKey = oldKey;
+                NewKey = newKey;
+            }
+        }
 
         /// <summary>Plain section for a milestone quota number, e.g. 3 -> "Quota 3".</summary>
         internal static string QuotaSection(int quota) =>
@@ -112,8 +169,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 ["Dim Lights"] = PresentationSection,
                 ["Light Dim Intensity"] = PresentationSection,
                 ["Override Additional Monitors"] = PresentationSection,
-                ["Additional Monitor Name Tokens"] = PresentationSection,
-                ["Mask Man Tail Buffer"] = PresentationSection
+                ["Additional Monitor Name Tokens"] = PresentationSection
             };
 
         /// <summary>
@@ -144,6 +200,9 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                         : new SplitConfigTarget(GeneralSection, key);
 
                 case LegacyPresentationSection:
+                    // #860: the Mask Man one-shot is gone, and its tail-buffer key with it.
+                    if (key == RetiredMaskManTailBufferKey)
+                        return null;
                     return PresentationBuckets.TryGetValue(key, out string presentationTarget)
                         ? new SplitConfigTarget(presentationTarget, key)
                         : new SplitConfigTarget(PresentationSection, key);
@@ -256,6 +315,10 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 migrated++;
             }
 
+            // #861 schema v2. Runs for every pre-v2 file, including the one the loop above has
+            // just lifted out of its numbered sections, so both upgrade paths share one table.
+            ApplySchemaV2Renames(normalized, ref migrated, ref removed, log);
+
             normalized[new ConfigDefinition(MigrationSection, MigrationVersionKey)] =
                 CurrentSchemaVersion.ToString(CultureInfo.InvariantCulture);
 
@@ -264,6 +327,80 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             log?.LogInfo(
                 $"Monitor Takeover config schema v{CurrentSchemaVersion} migration: "
                 + $"moved={migrated}, dropped={removed}. Values already in the new sections were kept.");
+        }
+
+        /// <summary>
+        /// Schema v2 (#861). Moves every v1 key to its new name, folds the per-monitor pair into
+        /// <c>MediaPerMonitor</c>, and drops the retired Mask Man key. Idempotent: on a file that
+        /// already carries only the new names it touches nothing.
+        /// </summary>
+        private static void ApplySchemaV2Renames(
+            Dictionary<ConfigDefinition, string> values,
+            ref int migrated,
+            ref int removed,
+            ManualLogSource log)
+        {
+            foreach (KeyRename rename in SchemaV2KeyRenames)
+                RenameKey(values, rename.Section, rename.OldKey, rename.NewKey, ref migrated, ref removed);
+
+            for (int quota = 1; quota <= 9; quota++)
+                RenameKey(values, QuotaSection(quota), RetiredQuotaMediaFileKey, QuotaMediaKey, ref migrated, ref removed);
+
+            var toggleDefinition = new ConfigDefinition(MediaSection, RetiredRandomPerMonitorMediaKey);
+            var poolDefinition = new ConfigDefinition(MediaSection, RetiredPerMonitorMediaPoolKey);
+            var perMonitorDefinition = new ConfigDefinition(MediaSection, MediaPerMonitorKey);
+            bool hadToggle = values.TryGetValue(toggleDefinition, out string toggle);
+            bool hadPool = values.TryGetValue(poolDefinition, out string pool);
+            if (hadToggle || hadPool)
+            {
+                bool wasOn = hadToggle && bool.TryParse(toggle, out bool parsed) && parsed;
+                if (values.ContainsKey(perMonitorDefinition))
+                {
+                    removed += (hadToggle ? 1 : 0) + (hadPool ? 1 : 0);
+                }
+                else
+                {
+                    values[perMonitorDefinition] = wasOn ? (pool ?? string.Empty) : string.Empty;
+                    migrated++;
+                    if (hadToggle && hadPool) removed++;
+                    if (!wasOn && !string.IsNullOrWhiteSpace(pool))
+                    {
+                        log?.LogInfo(
+                            $"Monitor Takeover config: {RetiredPerMonitorMediaPoolKey} was set but "
+                            + $"{RetiredRandomPerMonitorMediaKey} was off, so {MediaPerMonitorKey} is left blank and "
+                            + "the takeover keeps showing one shared video. Fill it in to turn per-monitor media on.");
+                    }
+                }
+                values.Remove(toggleDefinition);
+                values.Remove(poolDefinition);
+            }
+
+            if (values.Remove(new ConfigDefinition(PresentationSection, RetiredMaskManTailBufferKey)))
+                removed++;
+        }
+
+        private static void RenameKey(
+            Dictionary<ConfigDefinition, string> values,
+            string section,
+            string oldKey,
+            string newKey,
+            ref int migrated,
+            ref int removed)
+        {
+            var oldDefinition = new ConfigDefinition(section, oldKey);
+            if (!values.TryGetValue(oldDefinition, out string value))
+                return;
+
+            values.Remove(oldDefinition);
+            var newDefinition = new ConfigDefinition(section, newKey);
+            if (values.ContainsKey(newDefinition))
+            {
+                removed++;
+                return;
+            }
+
+            values[newDefinition] = value;
+            migrated++;
         }
 
         private static int GetSchemaVersion(Dictionary<ConfigDefinition, string> values)

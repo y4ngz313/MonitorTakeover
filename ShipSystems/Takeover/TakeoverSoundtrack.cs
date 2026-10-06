@@ -1,12 +1,17 @@
-﻿// TakeoverSoundtrack.cs - LGUMonitorTakeover
+// TakeoverSoundtrack.cs - LGUMonitorTakeover
 //
 // #715: resolves the host's published soundtrack decision into something the
-// quota takeover can actually play. Modelled on TakeoverAudioOverrides: the
-// registry owns the sandboxing and the SHA-256 host/client verification, this
-// only turns a verified path or a cached link into a playable plan.
+// quota takeover can try to play. Modelled on TakeoverAudioOverrides: TakeoverAudioPolicy
+// owns the sandboxing and the SHA-256 host/client verification, and a local file is decoded
+// by TakeoverAudioOverrides' one cache; this only turns a verified, decoded clip or a cached
+// link into a plan.
 //
-// Deliberately quota-only, like every other loose-file override: the Mask Man
-// sequence never reads a payload and therefore never reads a plan.
+// #861: a plan is not proof of playback. TakeoverManager confirms that the planned source
+// actually started (a local clip playing, a VideoPlayer prepared with an enabled audio track)
+// and drops a failed Replace back to the built-in bed.
+//
+// Quota takeovers only, like every other loose-file override: a takeover without a
+// payload never reads a plan.
 
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
 using UnityEngine;
@@ -39,19 +44,24 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         internal readonly TakeoverSoundtrackKind Kind;
         internal readonly string ResolvedPath;
         internal readonly float Volume;
+        /// <summary>The captured clip for <see cref="TakeoverSoundtrackKind.LocalClip"/>.</summary>
+        internal readonly AudioClip Clip;
 
-        internal TakeoverSoundtrackPlan(TakeoverSoundtrackMode mode, TakeoverSoundtrackKind kind, string resolvedPath, float volume)
+        internal TakeoverSoundtrackPlan(
+            TakeoverSoundtrackMode mode, TakeoverSoundtrackKind kind, string resolvedPath, float volume, AudioClip clip)
         {
             Mode = mode;
             Kind = kind;
             ResolvedPath = resolvedPath ?? string.Empty;
             Volume = volume;
+            Clip = clip;
         }
 
         /// <summary>
-        /// True only when Replace was asked for AND something is actually going to play. A
-        /// Replace whose source failed to resolve must not silence the bed — that is the
-        /// "never a silent takeover" rule.
+        /// True while Replace was asked for AND something is going to play or is still being
+        /// confirmed. The manager drops the plan to <c>default</c> the moment playback fails, so
+        /// a Replace whose source does not play never keeps the bed silent — the "never a
+        /// silent takeover" rule. A volume of 0 is still a playing soundtrack.
         /// </summary>
         internal bool Silences => Mode == TakeoverSoundtrackMode.Replace && Kind != TakeoverSoundtrackKind.None;
 
@@ -60,57 +70,39 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 
     internal static class TakeoverSoundtrack
     {
-        private static string _signature = string.Empty;
-        private static TakeoverAudioOverrideFile _file;
-
         /// <summary>
-        /// Idempotent. Called from BeginTakeover beside <see cref="TakeoverAudioOverrides.Prepare"/>
-        /// so the orbit delay is spent decoding rather than waiting.
+        /// #861: runs when the host publishes the plan and when a client receives it. A local
+        /// file is verified against the host's hash here and starts decoding at once; a link is
+        /// decoded by a VideoPlayer at playback time, so all this can do for one is make sure
+        /// the download has started.
         /// </summary>
-        internal static void Prepare(MonoBehaviour host)
+        internal static void Prepare(MonoBehaviour owner, TakeoverSoundtrackPlanWire wire)
         {
-            if (host == null) return;
-            TakeoverSoundtrackPlanWire wire = QuotaProgressionRegistry.GetSoundtrackPlan();
-            if (wire.IsOff)
+            if (owner == null) return;
+            if (wire.IsOff || YoutubeVideoResolver.IsYoutubeUrl(wire.Source))
             {
-                _signature = string.Empty;
-                _file = default;
+                if (!wire.IsOff) YoutubeVideoResolver.Prefetch(wire.Source);
+                TakeoverAudioOverrides.SelectSoundtrack(owner, wire, default);
                 return;
             }
 
-            if (YoutubeVideoResolver.IsYoutubeUrl(wire.Source))
-            {
-                // A link is decoded by a VideoPlayer at playback time, not here; all this can
-                // usefully do is make sure the download has started.
-                _signature = string.Empty;
-                _file = default;
-                YoutubeVideoResolver.Prefetch(wire.Source);
-                return;
-            }
-
-            string signature = wire.Source + "|" + wire.Hash;
-            if (!string.Equals(signature, _signature, System.StringComparison.Ordinal))
-            {
-                _signature = signature;
-                _file = QuotaProgressionRegistry.TryResolveAudioFile(wire.Source, wire.Hash, out string path)
-                    ? new TakeoverAudioOverrideFile(path, wire.Hash)
-                    : default;
-            }
-
-            TakeoverAudioOverrides.Request(host, _file);
+            TakeoverAudioFileCheck check = TakeoverAudioPolicy.VerifyPublishedFile(
+                QuotaProgressionRegistry.MediaDirectory, "Soundtrack", wire.Source, wire.Hash);
+            if (!check.Accepted)
+                TakeoverBootstrap.Log?.LogWarning("[TakeoverSoundtrack] " + check.Describe("no soundtrack plays on this player"));
+            TakeoverAudioOverrides.SelectSoundtrack(owner, wire, TakeoverAudioOverrideFile.From(check));
         }
-
-        /// <summary>Null until the local file has finished decoding, or when none is configured.</summary>
-        internal static AudioClip GetClip() => TakeoverAudioOverrides.Resolve(_file);
 
         /// <summary>
         /// Resolved once, at the head of TakeoverSequence and BEFORE SetupVideo, because
         /// SetupVideoForUrl needs to know whether the picture player's audio track is the
-        /// soundtrack, is muted by it, or is unaffected.
+        /// soundtrack, is muted by it, or is unaffected. <paramref name="localClip"/> is the
+        /// takeover's captured local soundtrack clip, null when none was ready; the capture has
+        /// already said why.
         /// </summary>
-        internal static TakeoverSoundtrackPlan ResolvePlan(string configuredMediaFile)
+        internal static TakeoverSoundtrackPlan ResolvePlan(
+            TakeoverSoundtrackPlanWire wire, string configuredMediaFile, AudioClip localClip)
         {
-            TakeoverSoundtrackPlanWire wire = QuotaProgressionRegistry.GetSoundtrackPlan();
             if (wire.IsOff) return default;
 
             if (YoutubeVideoResolver.IsYoutubeUrl(wire.Source))
@@ -122,28 +114,21 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                     // Same video on both settings: one decoder, and the picture player's own
                     // track becomes the soundtrack rather than a second copy of it.
                     return new TakeoverSoundtrackPlan(
-                        wire.Mode, TakeoverSoundtrackKind.ReuseVideoTrack, string.Empty, wire.Volume);
+                        wire.Mode, TakeoverSoundtrackKind.ReuseVideoTrack, string.Empty, wire.Volume, null);
                 }
 
                 if (YoutubeVideoResolver.TryGetCachedVideo(wire.Source, out string cached))
-                    return new TakeoverSoundtrackPlan(wire.Mode, TakeoverSoundtrackKind.YoutubeCached, cached, wire.Volume);
+                    return new TakeoverSoundtrackPlan(wire.Mode, TakeoverSoundtrackKind.YoutubeCached, cached, wire.Volume, null);
 
                 YoutubeVideoResolver.Prefetch(wire.Source);
                 TakeoverBootstrap.Log?.LogWarning(
-                    "[TakeoverSoundtrack] The configured soundtrack link is not cached yet; this takeover uses the built-in audio.");
+                    "[TakeoverSoundtrack] The configured soundtrack link is not cached yet; this takeover plays no soundtrack.");
                 return default;
             }
 
-            // Mirrors PlayAlarm's half-loaded rule: a clip that has not finished decoding falls
-            // back for this takeover rather than delaying the sequence, and is cached for the next.
-            AudioClip clip = GetClip();
-            if (clip != null)
-                return new TakeoverSoundtrackPlan(
-                    wire.Mode, TakeoverSoundtrackKind.LocalClip, _file.Path, wire.Volume);
-
-            TakeoverBootstrap.Log?.LogWarning(
-                $"[TakeoverSoundtrack] Soundtrack '{wire.Source}' is missing, does not match the host copy, or has not decoded yet; this takeover uses the built-in audio.");
-            return default;
+            return localClip != null
+                ? new TakeoverSoundtrackPlan(wire.Mode, TakeoverSoundtrackKind.LocalClip, string.Empty, wire.Volume, localClip)
+                : default;
         }
     }
 }

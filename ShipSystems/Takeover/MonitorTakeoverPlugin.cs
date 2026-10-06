@@ -11,8 +11,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 {
     /// <summary>
     /// The Monitor Takeover plugin: the quota milestone registry and its rewards, milestone unlock
-    /// gating, the quota announcement ceremony, the monitor takeover presentation and Mask Man,
-    /// and the final quota ending with its forced route and survival timer.
+    /// gating, the quota announcement ceremony, and the monitor takeover presentation.
     ///
     /// <para><b>#614 task 3.1.</b> This type was created in #612 task 1.4 as a plain static entry
     /// point called from <c>Y4NGZCompany.Plugin.Awake</c>, and extended in #613 task 2.1 to
@@ -32,14 +31,14 @@ namespace Y4NGZCompany.ShipSystems.Takeover
     /// fails to load. Everything the crew is <em>owed</em> — milestone evaluation, credits and
     /// reward grants, the store/suit unlock gate, the finale's route lock — is applied BEFORE that
     /// call and outside the isolation, so it survives both. Only the presentation (the video, the
-    /// mumbles, Mask Man, the ceremony's monitor lease) lives behind the
+    /// mumbles, the ceremony's monitor lease) lives behind the
     /// bootstrap. Disabling presentation therefore disables presentation and nothing else.</para>
     /// </summary>
     [BepInPlugin(Guid, Name, Version)]
     // Hard: this assembly compiles against Y4NGZCore (the module contract layer, the monitor
     // arbiter and its bindings, the quota reward and unlock contracts, the HUD suppression
     // registry, the UI theme substrate) and must load after it.
-    [BepInDependency("com.y4ngz.core", BepInDependency.DependencyFlags.HardDependency)]
+    [BepInDependency("com.y4ngz.core", "1.0.10")]
     //
     // ── NO dependency on com.y4ngz.company or com.y4ngz.company.shipsystems, and none may be
     //    added. ──────────────────────────────────────────────────────────────────────────────
@@ -96,7 +95,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         public const string Name = "Monitor Takeover";
 
         /// <summary>Plugin version.</summary>
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
 
         /// <summary>
         /// The wire-protocol revision this build of Monitor Takeover speaks, advertised through
@@ -327,7 +326,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             harmony.PatchAll(typeof(QuotaProgressionUnlockPatches));
 
             // (3) PRESENTATION. Everything that can be turned off: the video, the mumbles, the
-            // alarm, Mask Man, the ceremony's monitor lease. TakeoverBootstrap
+            // alarm, the ceremony's monitor lease. TakeoverBootstrap
             // returns early when Enabled is false or the bundle fails to load, and nothing above
             // this line is behind that gate.
             isolate("Monitor Takeover", () => Bootstrap.TakeoverBootstrap.Initialize(config, logger, harmony));
@@ -472,6 +471,20 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             _tornDown = true;
 
             ModuleTickRegistry.RunTeardown(ModuleHarmonyIds.MonitorTakeover);
+
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            // #861: the takeover's audio decodes run on a TakeoverAudioLoader on this host's
+            // object, which releases its own requests as the object goes. Shutdown also forgets
+            // the selection and destroys the decoded clips, whichever object ran the loads.
+            try
+            {
+                TakeoverAudioOverrides.Reset("Monitor Takeover host shut down");
+            }
+            catch (Exception ex)
+            {
+                log?.LogWarning($"Y4NGZMonitorTakeover shutdown warning: takeover audio reset failed: {ex.Message}");
+            }
+#endif
 
             if (harmony == null)
                 return;

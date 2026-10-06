@@ -64,8 +64,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private Action _onTakeoverFinished;
 
         // Raised after a takeover sequence has fully restored the ship and the
-        // onFinished callback has run. Fires for every variant (standard,
-        // Mask Man, final orbit) but never from ForceRestore.
+        // onFinished callback has run. Never raised from ForceRestore.
         public static event Action OnTakeoverEnded;
 
         // ── Saved monitor state ───────────────────────────────────────────────
@@ -130,8 +129,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         // refcounted registry on cleanup.
         private readonly List<GameObject> _hiddenHotbarObjects = new List<GameObject>();
 
-        // #451: HideHUD is reached from both TakeoverSequence and MaskManSequence,
-        // and a queued takeover can restart the sequence before RestoreHUD has run.
+        // #451: a queued takeover can restart TakeoverSequence before RestoreHUD has run.
         // A live hide must never be re-snapshotted.
         private bool _hudHidden;
 
@@ -166,7 +164,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         // from a user-configured source cannot re-select a loose file that has
         // already been tried and rejected.
         private bool _looseDefaultVideoInUse;
-        // #661 UseMediaLengthAsDuration. _mediaLengthPending is true while the
+        // #661 HoldForWholeVideo. _mediaLengthPending is true while the
         // sequence is still waiting to learn the configured media's length;
         // _mediaLengthSeconds is the clamped hold once it is known, and stays 0
         // when the length never became available or the watchdog handed the
@@ -233,14 +231,32 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private AudioSource _mumbleSource;
         private AudioSource _alarmSource;
         private AudioSource _droneSource;
+        // The voice loop, so a Replace that fails after the voices were due can start it once
+        // and never twice.
+        private Coroutine _mumbleCoroutine;
         private GameObject _dialogueCanvasGO;
         private Texture2D _customImageTexture;
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
         private bool _useQuotaProgressionPayload;
+        // #861: the takeover's one audio decision (configured alarm, voices, local soundtrack),
+        // captured at the shared preparation deadline. Its clips are pinned until RestoreAll.
+        private TakeoverAudioSnapshot _audio = TakeoverAudioSnapshot.Empty;
+        // #861: true from the audio decision until the CRT transition or a restore. Nothing may
+        // start, restart or recover a bed layer outside it, which is what keeps a late player
+        // error from reviving audio after ForceRestore.
+        private bool _audioBedOpen;
+        // #861: the ongoing bed layers a Replace soundtrack suppressed when they came due. A
+        // Replace that fails afterwards starts exactly these, once. The whine and the siren are
+        // deliberately not tracked: they are the takeover's opening, and a late one is a fault.
+        private bool _droneSuppressed;
+        private bool _mumbleSuppressed;
         // #715 takeover soundtrack. The plan is resolved once at the head of TakeoverSequence
-        // and is only ever non-None when _useQuotaProgressionPayload is true, so the Mask Man
-        // sequence cannot observe any of it.
+        // and is only ever non-None when _useQuotaProgressionPayload is true.
         private TakeoverSoundtrackPlan _soundtrackPlan;
+        // #861: a plan is not playback. True once the source is confirmed: a local clip
+        // playing, or a VideoPlayer prepared with an enabled audio track routed to our source.
+        private bool _soundtrackConfirmed;
+        private float _soundtrackStartedAt;
         private AudioSource _soundtrackSource;
         // Only for TakeoverSoundtrackKind.YoutubeCached: a second, hidden VideoPlayer whose
         // picture goes nowhere and whose audio track is the soundtrack. Unity has no
@@ -248,10 +264,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private VideoPlayer _soundtrackPlayer;
         private RenderTexture _soundtrackDummyRT;
         private Coroutine _soundtrackCoroutine;
+        private static readonly WaitForSeconds SoundtrackStartupPoll = new WaitForSeconds(0.25f);
+        private static readonly WaitForSeconds SoundtrackPlayingPoll = new WaitForSeconds(0.5f);
 
         /// <summary>
-        /// True only while Replace is in force AND the soundtrack actually resolved. A failed
-        /// Replace must leave the built-in bed alone rather than produce a silent takeover.
+        /// True while Replace is in force and the soundtrack has not failed: from the plan
+        /// until playback is confirmed (so the bed is never heard and then cut), and for as long
+        /// as it then plays. <see cref="FailSoundtrack"/> drops the plan, which ends this.
         /// </summary>
         private bool SoundtrackSilencesBed => _soundtrackPlan.Silences;
 #endif
@@ -325,42 +344,16 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
             _useQuotaProgressionPayload = true;
             Y4NGZCompany.Core.QuotaProgressionRegistry.PrepareHostTakeoverPayload(DialoguePool);
-            // Start decoding any loose-file audio overrides now: the orbit delay
-            // is the only headroom before the alarm needs a clip.
-            TakeoverAudioOverrides.Prepare(this, DialoguePool);
-            TakeoverSoundtrack.Prepare(this);
+            // #861: the selection normally started decoding when the host built it or this
+            // client received it. This covers a client that never received one and restarts any
+            // load that was interrupted; it re-verifies nothing already prepared.
+            Y4NGZCompany.Core.QuotaProgressionRegistry.EnsureTakeoverAudioPrepared(DialoguePool, this);
 #endif
             _activeDialoguePool = DialoguePool;
             _onTakeoverFinished = null;
             if (_takeoverCoroutine != null) StopCoroutine(_takeoverCoroutine);
             _takeoverCoroutine = StartCoroutine(TakeoverSequence(
                 skipOrbitDelay ? 0f : TakeoverBootstrap.CfgOrbitDelay.Value));
-        }
-
-        // Mask Man variant entry point. Same gating as BeginTakeover so two
-        // simultaneous sequences can't stomp each other; ForceRestore tracks
-        // the same _currentCoroutine field, so cleanup paths are unchanged.
-        internal void BeginMaskManTakeover(
-            bool skipOrbitDelay = false,
-            bool persistCompletion = true)
-        {
-            if (_takeoverActive) return;
-#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            _useQuotaProgressionPayload = false;
-#endif
-            _activeDialoguePool = DialoguePool;
-            _onTakeoverFinished = null;
-            if (TakeoverBootstrap.MaskManVideoClip == null || TakeoverBootstrap.MaskManAudioClip == null)
-            {
-                TakeoverBootstrap.Log.LogError(
-                    $"[TakeoverManager] BeginMaskManTakeover: missing assets " +
-                    $"(video={(TakeoverBootstrap.MaskManVideoClip != null)}, audio={(TakeoverBootstrap.MaskManAudioClip != null)}). Aborting.");
-                return;
-            }
-            if (_takeoverCoroutine != null) StopCoroutine(_takeoverCoroutine);
-            _takeoverCoroutine = StartCoroutine(MaskManSequence(
-                skipOrbitDelay ? 0f : TakeoverBootstrap.CfgOrbitDelay.Value,
-                persistCompletion));
         }
 
         internal void ForceRestore(string reason)
@@ -395,10 +388,30 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             _mediaLengthSeconds = 0d;
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
             _soundtrackPlan = default;
+            _soundtrackConfirmed = false;
+            _audio = TakeoverAudioSnapshot.Empty;
+            _audioBedOpen = false;
+            _droneSuppressed = false;
+            _mumbleSuppressed = false;
+
+            // #861: the common audio preparation window. Every quota takeover waits at least
+            // TakeoverAudioPolicy.PreparationWindowSeconds before its first step, on every peer
+            // and whatever is or is not loaded, and decides its audio once at that deadline. The
+            // default Orbit Delay already covers it; a shorter one, or the debug skip-delay path,
+            // is raised to it. It never extends the takeover itself.
+            float preSequenceDelay = Y4NGZCompany.Core.TakeoverAudioPolicy.PreSequenceDelaySeconds(orbitDelay);
+            if (preSequenceDelay > orbitDelay)
+            {
+                TakeoverBootstrap.Log.LogInfo(
+                    $"[TakeoverManager] Orbit Delay {Mathf.Max(0f, orbitDelay):F1}s is shorter than the "
+                    + $"{preSequenceDelay:F1}s audio preparation window; starting after the window.");
+            }
+#else
+            float preSequenceDelay = orbitDelay;
 #endif
 
-            if (orbitDelay > 0f)
-                yield return new WaitForSeconds(orbitDelay);
+            if (preSequenceDelay > 0f)
+                yield return new WaitForSeconds(preSequenceDelay);
 
             if (StartOfRound.Instance == null || !StartOfRound.Instance.inShipPhase)
             {
@@ -421,19 +434,19 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             float elapsed  = 0f;
 
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            // Second chance for a client whose payload landed after BeginTakeover.
+            // #861: the one audio decision. Whatever finished loading in the preparation window
+            // is used and pinned; anything still loading or failed falls back for this takeover,
+            // with one line saying which file and why, and keeps loading for the next. Nothing
+            // decoded after this point changes this takeover.
             if (_useQuotaProgressionPayload)
-            {
-                TakeoverAudioOverrides.Prepare(this, DialoguePool);
-                TakeoverSoundtrack.Prepare(this);
-            }
+                _audio = TakeoverAudioOverrides.Capture();
 #endif
 
             // #669: start decoding here rather than at the monitor handoff.
             // Everything between this point and step 3 — the whine, the 1.5s
             // dim-lights ramp, the drone, the HUD hide — is free headroom for
             // the decoder, and none of it depends on video. Deliberately still
-            // AFTER the payload second chance above, so a client whose media
+            // AFTER the audio decision above, so a client whose media
             // selection landed late is read from the same state it always was.
             // OpenBodyCams is suppressed first for the reason step 3 gave: its
             // UpdateScreenMaterial must be off before any surface we are about
@@ -441,11 +454,14 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
             // #715: resolved BEFORE SetupVideo because SetupVideoForUrl has to know whether the
             // picture player's own audio track IS the soundtrack, is muted by one, or is
-            // unaffected. Quota takeovers only - the Mask Man path never reaches here.
+            // unaffected. Quota takeovers only.
             _soundtrackPlan = _useQuotaProgressionPayload
                 ? TakeoverSoundtrack.ResolvePlan(
-                    Y4NGZCompany.Core.QuotaProgressionRegistry.GetCurrentPayload(DialoguePool).MediaFile)
+                    Y4NGZCompany.Core.QuotaProgressionRegistry.GetSoundtrackPlan(),
+                    Y4NGZCompany.Core.QuotaProgressionRegistry.GetCurrentPayload(DialoguePool).MediaFile,
+                    _audio.Soundtrack)
                 : default;
+            _audioBedOpen = true;
 #endif
             OpenBodyCamsCompat.Suppress();
             SetupVideo();
@@ -459,7 +475,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             _mediaPlan = _useQuotaProgressionPayload ? TakeoverMediaPlan.Resolve() : default;
             if (_mediaPlan.Active)
                 SetupAdditionalMediaPlayers(
-                    _mediaPlan, looping: Y4NGZCompany.Core.QuotaProgressionRegistry.LoopMedia);
+                    _mediaPlan, looping: Y4NGZCompany.Core.QuotaProgressionRegistry.LoopVideo);
 #endif
 
             // Atmosphere: power-down whine as ship systems go dark
@@ -499,7 +515,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             // hands over whether or not the decoder is ready, and VideoPlayer.length
             // only carries a real value once isPrepared is true.
             if (_useQuotaProgressionPayload
-                && Y4NGZCompany.Core.QuotaProgressionRegistry.UseMediaLengthAsDuration
+                && Y4NGZCompany.Core.QuotaProgressionRegistry.HoldForWholeVideo
                 && _usingConfiguredVideoSource)
             {
                 StartCoroutine(AdoptConfiguredMediaLength());
@@ -522,10 +538,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             // Step 4 — Mumble audio through dedicated speaker AudioSource
             TakeoverBootstrap.Log.LogInfo("[TakeoverManager] Seq: starting PlayMumbleSequence coroutine.");
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            // #715 Replace silences the voices too; Mix and Off start them as before.
-            if (!SoundtrackSilencesBed)
+            // #715 Replace silences the voices too; Mix and Off start them as before. #861: a
+            // suppressed loop is remembered, so a Replace that fails later can start it once.
+            if (SoundtrackSilencesBed)
+                _mumbleSuppressed = true;
+            else
 #endif
-            StartCoroutine(PlayMumbleSequence());
+            StartMumble();
 
             // Step 5 — Typewriter dialogue
             var dialoguePool = _activeDialoguePool ?? DialoguePool;
@@ -575,151 +594,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         {
             try { OnTakeoverEnded?.Invoke(); }
             catch (Exception ex) { TakeoverBootstrap.Log.LogWarning($"[TakeoverManager] OnTakeoverEnded handler failed: {ex.Message}"); }
-        }
-
-        // ─────────────────────────────────────────────────────────────────────
-        // Mask Man Sequence (quota 3, one-shot)
-        // ─────────────────────────────────────────────────────────────────────
-        // Mirrors TakeoverSequence structurally but:
-        //   • plays TakeoverBootstrap.MaskManVideoClip in place of TakeoverVideoClip,
-        //   • plays TakeoverBootstrap.MaskManAudioClip ONCE (no mumble loop, no typewriter),
-        //   • duration is driven by audio.length + CfgMaskManTailBuffer.
-        // Same lights/HUD/monitor override + OBC suppress as the regular path.
-        private IEnumerator MaskManSequence(float orbitDelay, bool persistCompletion)
-        {
-            _takeoverActive = true;
-
-            if (orbitDelay > 0f)
-                yield return new WaitForSeconds(orbitDelay);
-
-            if (StartOfRound.Instance == null || !StartOfRound.Instance.inShipPhase)
-            {
-                _takeoverActive = false;
-                _takeoverCoroutine = null;
-                yield break;
-            }
-
-            // Null guard — if assets vanished between Begin and now, restore any
-            // state we already touched and bail cleanly.
-            if (TakeoverBootstrap.MaskManVideoClip == null || TakeoverBootstrap.MaskManAudioClip == null)
-            {
-                TakeoverBootstrap.Log.LogError("[TakeoverManager] MaskManSequence: assets null at runtime — aborting.");
-                RestoreAll(immediate: true);
-                _takeoverActive = false;
-                _takeoverCoroutine = null;
-                yield break;
-            }
-
-            // Mute the ship PA so the orbital announcement doesn't talk over us.
-            var sor = StartOfRound.Instance;
-            if (sor.speakerAudioSource != null)
-            {
-                _savedSpeakerVolume = sor.speakerAudioSource.volume;
-                sor.speakerAudioSource.volume = 0f;
-                _speakerVolumeSaved = true;
-            }
-
-            // Duration scales to the Mask Man audio clip + a small tail buffer.
-            float duration = TakeoverBootstrap.MaskManAudioClip.length + TakeoverBootstrap.CfgMaskManTailBuffer.Value;
-            float elapsed  = 0f;
-
-            // #669: decode during the lights/alarm ramp, not at the handoff.
-            OpenBodyCamsCompat.Suppress();
-            SetupVideoFor(TakeoverBootstrap.MaskManVideoClip, looping: true);
-
-            TakeoverBootstrap.Log.LogInfo(
-                $"[TakeoverManager] MaskMan: duration={duration:F2}s " +
-                $"(audio={TakeoverBootstrap.MaskManAudioClip.length:F2}s + buffer={TakeoverBootstrap.CfgMaskManTailBuffer.Value:F2}s).");
-
-            // Atmosphere — power-down whine
-            PlayPowerDownWhine();
-
-            // Step 1 — Lights + alarm
-            if (TakeoverBootstrap.CfgDimLights.Value)
-            {
-                yield return StartCoroutine(DimLights());
-                _flashCoroutine = StartCoroutine(FlashLightsLoop());
-            }
-            else
-                PlayAlarm();
-
-            // Atmosphere — drone (uses CfgTakeoverDuration internally for length;
-            // since our sequence is longer, the drone may end before we do —
-            // that's fine, the alarm + audio carry the rest).
-            StartDrone();
-
-            // Step 2 — Hide HUD
-            if (TakeoverBootstrap.CfgHideHUD.Value)
-                HideHUD();
-
-            // Step 3 — Monitor override. Video setup moved to the head of the
-            // sequence for the reason TakeoverSequence gives (#669).
-            yield return StartCoroutine(PrimeVideoForDisplay());
-            // Same-frame handoff as the Y4NGZ path — see TakeoverSequence.
-            ShipSystemsTakeoverBridge.BeginExternalMonitorTakeover(_renderTexture);
-            OverrideMonitors();
-
-            // Step 4 — Mask Man dialogue audio. Single PlayOneShot, NO loop and
-            // NO typewriter — Mask Man's words are baked into the clip itself.
-            var maskAudioGO = new GameObject("MaskMan_Audio");
-            DontDestroyOnLoad(maskAudioGO);
-            _mumbleSource = maskAudioGO.AddComponent<AudioSource>();
-            if (sor?.speakerAudioSource != null)
-                maskAudioGO.transform.position = sor.speakerAudioSource.transform.position;
-            else if (sor != null)
-                maskAudioGO.transform.position = sor.transform.position;
-            _mumbleSource.spatialBlend = 0f;        // 2D — heard ship-wide
-            _mumbleSource.volume       = 1f;        // dry, full — no degraded-speaker filter
-            _mumbleSource.loop         = false;
-            _mumbleSource.playOnAwake  = false;
-            _mumbleSource.PlayOneShot(TakeoverBootstrap.MaskManAudioClip);
-            TakeoverBootstrap.Log.LogInfo(
-                $"[TakeoverManager] MaskMan: PlayOneShot '{TakeoverBootstrap.MaskManAudioClip.name}' " +
-                $"({TakeoverBootstrap.MaskManAudioClip.length:F2}s) isPlaying={_mumbleSource.isPlaying}.");
-
-            // Persist the per-save one-shot flag now that video + audio are
-            // both confirmed running. Doing it here (rather than at trigger
-            // time in Patches.cs) means an aborted takeover does NOT lock the
-            // player out for the rest of the save. Debug replays skip it.
-            if (persistCompletion)
-            {
-                try
-                {
-                    var saveName = GameNetworkManager.Instance?.currentSaveFileName;
-                    if (!string.IsNullOrEmpty(saveName))
-                    {
-                        ES3.Save<bool>(QuotaSaveKeys.MaskManFired, true, saveName);
-                        TakeoverBootstrap.Log.LogInfo(
-                            $"[TakeoverManager] Persisted Y4NGZ_MaskManFired=true to save '{saveName}'.");
-                    }
-                    else
-                    {
-                        TakeoverBootstrap.Log.LogWarning(
-                            "[TakeoverManager] Could not persist Y4NGZ_MaskManFired — currentSaveFileName is null.");
-                    }
-                }
-                catch (System.Exception ex)
-                {
-                    TakeoverBootstrap.Log.LogWarning(
-                        $"[TakeoverManager] Failed to persist Y4NGZ_MaskManFired: {ex.Message}");
-                }
-            }
-
-            // Hold for the computed duration
-            while (elapsed < duration) { elapsed += Time.deltaTime; yield return null; }
-
-            // Stop the emergency flash before CRT transition
-            if (_flashCoroutine != null) { StopCoroutine(_flashCoroutine); _flashCoroutine = null; }
-
-            // Step 5 — CRT channel-change transition (same as Y4NGZ path)
-            yield return StartCoroutine(CRTTransition());
-
-            // Step 6 — Restore (same path as Y4NGZ — handles MaskMan state too)
-            yield return StartCoroutine(RestoreCoroutine());
-            _takeoverActive = false;
-            _takeoverCoroutine = null;
-
-            RaiseTakeoverEnded();
         }
 
         // ─────────────────────────────────────────────────────────────────────
@@ -794,27 +668,25 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private void PlayAlarm()
         {
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            // #715 Replace: this layer of the built-in bed is suppressed for the whole takeover.
+            // #715 Replace: this layer of the built-in bed is suppressed. #861: it is the
+            // takeover's opening, so a Replace that fails later never starts it late.
             if (SoundtrackSilencesBed) return;
 #endif
-            // Priority: 0) configured AlarmAudioFile (quota takeover only, once it
+            // Priority: 0) configured AlarmFile (quota takeover only, once it
             // has decoded), 1) bundle Y4NGZ_Klaxon, 2) in-game alarm (rejected if
             // <1s), 3) procedural klaxon.
             AudioClip alarmClip = null;
             string source = null;
 
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            // Quota takeover only, and only once the file has finished decoding —
-            // a half-loaded override falls back rather than delaying the sequence.
-            if (_useQuotaProgressionPayload)
+            // Quota takeover only, and only the clip this takeover's audio decision captured —
+            // a file still loading at that deadline falls back rather than delaying the sequence.
+            if (_useQuotaProgressionPayload && _audio.Alarm != null)
             {
-                alarmClip = TakeoverAudioOverrides.GetAlarmClip();
-                if (alarmClip != null)
-                {
-                    source = "config:" + alarmClip.name;
-                    TakeoverBootstrap.Log.LogInfo(
-                        $"[TakeoverManager] PlayAlarm: using configured clip '{alarmClip.name}' ({alarmClip.length:F2}s).");
-                }
+                alarmClip = _audio.Alarm;
+                source = "config:" + alarmClip.name;
+                TakeoverBootstrap.Log.LogInfo(
+                    $"[TakeoverManager] PlayAlarm: using configured clip '{alarmClip.name}' ({alarmClip.length:F2}s).");
             }
 
 #endif
@@ -1037,7 +909,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private void PlayPowerDownWhine()
         {
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            // #715 Replace: this layer of the built-in bed is suppressed for the whole takeover.
+            // #715 Replace: this layer of the built-in bed is suppressed. #861: it is the
+            // takeover's opening, so a Replace that fails later never starts it late.
             if (SoundtrackSilencesBed) return;
 #endif
             int   sampleRate = 44100;
@@ -1091,8 +964,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private void StartDrone()
         {
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            // #715 Replace: this layer of the built-in bed is suppressed for the whole takeover.
-            if (SoundtrackSilencesBed) return;
+            // #715 Replace: this layer of the built-in bed is suppressed. #861: remembered, so a
+            // Replace that fails later starts the drone once for the rest of the takeover.
+            if (SoundtrackSilencesBed)
+            {
+                _droneSuppressed = true;
+                return;
+            }
 #endif
             int   sampleRate = 44100;
             float duration   = TakeoverBootstrap.CfgTakeoverDuration.Value + 4f; // outlast the sequence
@@ -1165,10 +1043,18 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         // Started immediately after SetupVideo and before any bed layer, so a
         // Replace never briefly plays what it is about to silence. It loops for
         // the whole takeover and deliberately does NOT influence the hold length:
-        // UseMediaLengthAsDuration keys off the picture player only.
+        // HoldForWholeVideo keys off the picture player only.
+        //
+        // #861: the plan is a promise, not playback. A local clip must actually be playing
+        // when it is started (checked before the whine and the siren, so a clip that will not
+        // play costs nothing); a VideoPlayer source has SoundtrackStartupSeconds to prepare
+        // with an enabled audio track routed to our source. Whatever fails, then or later,
+        // goes through FailSoundtrack: the soundtrack is stopped and muted, Replace ends, and
+        // the drone and voices it held back start once.
 
         private void StartSoundtrack()
         {
+            _soundtrackStartedAt = Time.time;
             switch (_soundtrackPlan.Kind)
             {
                 case TakeoverSoundtrackKind.None:
@@ -1176,24 +1062,31 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 
                 case TakeoverSoundtrackKind.LocalClip:
                 {
-                    AudioClip clip = TakeoverSoundtrack.GetClip();
+                    AudioClip clip = _soundtrackPlan.Clip;
                     if (clip == null)
                     {
-                        // Decoded when the plan was resolved, gone now: fall back rather than
-                        // leave a Replace holding a silenced bed.
-                        TakeoverBootstrap.Log.LogWarning(
-                            "[TakeoverManager] StartSoundtrack: the resolved soundtrack clip disappeared; using the built-in audio.");
-                        _soundtrackPlan = default;
+                        FailSoundtrack("its decoded clip was destroyed before it could start");
                         return;
                     }
                     AudioSource source = EnsureSoundtrackSource();
-                    if (source == null) { _soundtrackPlan = default; return; }
+                    if (source == null)
+                    {
+                        FailSoundtrack("no audio source could be created for it");
+                        return;
+                    }
                     source.clip = clip;
                     source.loop = true;
                     source.Play();
+                    if (!source.isPlaying)
+                    {
+                        FailSoundtrack($"'{clip.name}' did not start playing");
+                        return;
+                    }
+                    _soundtrackConfirmed = true;
                     TakeoverBootstrap.Log.LogInfo(
                         $"[TakeoverManager] StartSoundtrack: playing '{clip.name}' ({clip.length:F2}s) "
                         + $"mode={_soundtrackPlan.Mode} vol={_soundtrackPlan.Volume:F2}.");
+                    _soundtrackCoroutine = StartCoroutine(WatchSoundtrack());
                     return;
                 }
 
@@ -1204,22 +1097,24 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                     // screen to the bundled clip), nothing bound it and there is no soundtrack.
                     if (!_usingConfiguredVideoSource)
                     {
-                        TakeoverBootstrap.Log.LogWarning(
-                            "[TakeoverManager] StartSoundtrack: the shared soundtrack/media video is not playing, "
-                            + "so there is no track to reuse; using the built-in audio.");
-                        _soundtrackPlan = default;
+                        FailSoundtrack("the takeover video it shares is not playing, so there is no track to reuse");
                         return;
                     }
                     TakeoverBootstrap.Log.LogInfo(
                         $"[TakeoverManager] StartSoundtrack: reusing the takeover video's own audio track "
-                        + $"(mode={_soundtrackPlan.Mode} vol={_soundtrackPlan.Volume:F2}).");
+                        + $"(mode={_soundtrackPlan.Mode} vol={_soundtrackPlan.Volume:F2}); waiting for it to prepare.");
+                    _soundtrackCoroutine = StartCoroutine(WatchSoundtrack());
                     return;
                 }
 
                 case TakeoverSoundtrackKind.YoutubeCached:
                 {
                     AudioSource source = EnsureSoundtrackSource();
-                    if (source == null) { _soundtrackPlan = default; return; }
+                    if (source == null)
+                    {
+                        FailSoundtrack("no audio source could be created for it");
+                        return;
+                    }
                     try
                     {
                         // 4x4: the picture is never shown, but a RenderTexture render mode is
@@ -1238,6 +1133,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                         _soundtrackPlayer.waitForFirstFrame = false;
                         _soundtrackPlayer.audioOutputMode = VideoAudioOutputMode.AudioSource;
                         _soundtrackPlayer.controlledAudioTrackCount = 1;
+                        _soundtrackPlayer.EnableAudioTrack(0, true);
                         _soundtrackPlayer.SetTargetAudioSource(0, source);
                         // Deliberately NOT HardenAndPrepare: that helper zeroes audio tracks
                         // when the mode is None and re-subscribes the PICTURE player's error and
@@ -1248,36 +1144,146 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                         _soundtrackPlayer.Play();
                         TakeoverBootstrap.Log.LogInfo(
                             $"[TakeoverManager] StartSoundtrack: driving the cached soundtrack video's audio track "
-                            + $"(mode={_soundtrackPlan.Mode} vol={_soundtrackPlan.Volume:F2}).");
+                            + $"(mode={_soundtrackPlan.Mode} vol={_soundtrackPlan.Volume:F2}); waiting for it to prepare.");
                     }
                     catch (Exception ex)
                     {
-                        TakeoverBootstrap.Log.LogWarning(
-                            $"[TakeoverManager] StartSoundtrack: the hidden soundtrack player failed to start ({ex.GetType().Name}); using the built-in audio.");
-                        _soundtrackPlan = default;
+                        FailSoundtrack($"the hidden soundtrack player failed to start ({ex.GetType().Name}: {ex.Message})");
+                        return;
                     }
+                    _soundtrackCoroutine = StartCoroutine(WatchSoundtrack());
                     return;
                 }
             }
         }
 
         /// <summary>
-        /// Re-plays a soundtrack source that stopped on its own. An AudioSource with loop=true
-        /// does not need this, but a source driven by a VideoPlayer track can fall silent when
-        /// the player restarts its loop, and a takeover held open by
-        /// <c>UseMediaLengthAsDuration</c> can outlast a short track.
+        /// #861. Confirms a VideoPlayer-driven soundtrack within
+        /// <see cref="Y4NGZCompany.Core.TakeoverAudioPolicy.SoundtrackStartupSeconds"/>, then keeps
+        /// a local clip playing for the rest of the takeover. Never logs per tick, never retries a
+        /// failure: anything it cannot fix goes to <see cref="FailSoundtrack"/> once. A takeover
+        /// held open by <c>HoldForWholeVideo</c> can outlast a short track, which is why a stopped
+        /// local source is restarted.
         /// </summary>
-        private IEnumerator SoundtrackLoopWatch()
+        private IEnumerator WatchSoundtrack()
         {
-            while (_takeoverActive && _soundtrackSource != null)
+            while (_takeoverActive && _audioBedOpen && _soundtrackPlan.Active)
             {
+                if (!_soundtrackConfirmed)
+                {
+                    string failure = CheckSoundtrackStartup(out bool confirmed);
+                    if (failure != null)
+                    {
+                        FailSoundtrack(failure);
+                        yield break;
+                    }
+                    if (confirmed)
+                    {
+                        _soundtrackConfirmed = true;
+                        TakeoverBootstrap.Log.LogInfo(
+                            $"[TakeoverManager] Soundtrack confirmed after {Time.time - _soundtrackStartedAt:F1}s: "
+                            + $"the {(_soundtrackPlan.Kind == TakeoverSoundtrackKind.ReuseVideoTrack ? "takeover video's" : "cached soundtrack video's")} "
+                            + "audio track is prepared and routed.");
+                    }
+                    else if (Time.time - _soundtrackStartedAt >= Y4NGZCompany.Core.TakeoverAudioPolicy.SoundtrackStartupSeconds)
+                    {
+                        FailSoundtrack(
+                            $"its video did not prepare an audio track within {Y4NGZCompany.Core.TakeoverAudioPolicy.SoundtrackStartupSeconds:F0}s");
+                        yield break;
+                    }
+                    yield return SoundtrackStartupPoll;
+                    continue;
+                }
+
                 if (_soundtrackPlan.Kind == TakeoverSoundtrackKind.LocalClip
-                    && _soundtrackSource.clip != null
+                    && _soundtrackSource != null
                     && !_soundtrackSource.isPlaying)
                 {
                     _soundtrackSource.Play();
+                    if (!_soundtrackSource.isPlaying)
+                    {
+                        FailSoundtrack("the local soundtrack stopped and would not restart");
+                        yield break;
+                    }
                 }
-                yield return new WaitForSeconds(0.5f);
+                yield return SoundtrackPlayingPoll;
+            }
+        }
+
+        /// <summary>
+        /// Null while the source is still starting or once it is confirmed; otherwise why it
+        /// can never play. "Confirmed" for a VideoPlayer means prepared, with an audio track,
+        /// that track enabled and routed to the soundtrack source. A volume of 0 still confirms.
+        /// </summary>
+        private string CheckSoundtrackStartup(out bool confirmed)
+        {
+            confirmed = false;
+            switch (_soundtrackPlan.Kind)
+            {
+                case TakeoverSoundtrackKind.LocalClip:
+                    if (_soundtrackSource == null) return "its audio source is gone";
+                    confirmed = _soundtrackSource.isPlaying;
+                    return null;
+                case TakeoverSoundtrackKind.YoutubeCached:
+                    return CheckSoundtrackPlayer(_soundtrackPlayer, out confirmed);
+                case TakeoverSoundtrackKind.ReuseVideoTrack:
+                    if (!_usingConfiguredVideoSource)
+                        return "the takeover video it shares fell back to the default video";
+                    return CheckSoundtrackPlayer(_videoPlayer, out confirmed);
+                default:
+                    return null;
+            }
+        }
+
+        private string CheckSoundtrackPlayer(VideoPlayer player, out bool confirmed)
+        {
+            confirmed = false;
+            if (player == null) return "its video player is gone";
+            if (!player.isPrepared) return null;
+            if (player.audioTrackCount == 0) return "its video has no audio track";
+            if (!player.IsAudioTrackEnabled(0)) return "its video's audio track is disabled";
+            if (player.audioOutputMode != VideoAudioOutputMode.AudioSource
+                || _soundtrackSource == null
+                || player.GetTargetAudioSource(0) != _soundtrackSource)
+                return "its video's audio is not routed to the soundtrack";
+            confirmed = true;
+            return null;
+        }
+
+        /// <summary>
+        /// #861. The one way out of a soundtrack that does not play. Idempotent: the first call
+        /// drops the plan, so a second error, a timeout and a fallback swap arriving together
+        /// recover once. The source is stopped and muted (a VideoPlayer that prepares late can
+        /// no longer be heard), the hidden player is disposed, and — only while the takeover's
+        /// audio is still open — the drone and the voices that Replace held back start now.
+        /// The whine and the siren are never started late.
+        /// </summary>
+        private void FailSoundtrack(string reason)
+        {
+            if (!_soundtrackPlan.Active) return;
+            bool wasReplacing = _soundtrackPlan.Silences;
+            TakeoverBootstrap.Log.LogWarning(
+                $"[TakeoverManager] Soundtrack failed: {reason}. "
+                + (wasReplacing
+                    ? "Leaving Replace: the drone and voice lines play for the rest of this takeover."
+                    : "The takeover audio continues without it."));
+
+            StopSoundtrack(null);
+            if (_soundtrackSource != null) _soundtrackSource.mute = true;
+            DisposeSoundtrackPlayer();
+            _soundtrackPlan = default;
+            _soundtrackConfirmed = false;
+
+            if (!_takeoverActive || !_audioBedOpen) return;
+            if (_droneSuppressed)
+            {
+                _droneSuppressed = false;
+                if (_droneSource == null) StartDrone();
+            }
+            if (_mumbleSuppressed)
+            {
+                _mumbleSuppressed = false;
+                StartMumble();
             }
         }
 
@@ -1293,6 +1299,27 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             if (_soundtrackSource != null) { try { _soundtrackSource.Stop(); } catch { } }
             if (!string.IsNullOrEmpty(reason) && _soundtrackPlan.Active)
                 TakeoverBootstrap.Log.LogInfo($"[TakeoverManager] StopSoundtrack: {reason}.");
+        }
+
+        /// <summary>
+        /// The hidden soundtrack VideoPlayer and its dummy RenderTexture. Order matters: the
+        /// player must let go of the RT before the RT is released.
+        /// </summary>
+        private void DisposeSoundtrackPlayer()
+        {
+            if (_soundtrackPlayer != null)
+            {
+                try { _soundtrackPlayer.Stop(); } catch { }
+                _soundtrackPlayer.errorReceived -= OnSoundtrackErrorReceived;
+                Destroy(_soundtrackPlayer);
+                _soundtrackPlayer = null;
+            }
+            if (_soundtrackDummyRT != null)
+            {
+                _soundtrackDummyRT.Release();
+                Destroy(_soundtrackDummyRT);
+                _soundtrackDummyRT = null;
+            }
         }
 
         private AudioSource EnsureSoundtrackSource()
@@ -1316,21 +1343,20 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             _soundtrackSource.volume = _soundtrackPlan.Volume;
             _soundtrackSource.loop = true;
             _soundtrackSource.playOnAwake = false;
-            _soundtrackCoroutine = StartCoroutine(SoundtrackLoopWatch());
             return _soundtrackSource;
         }
 
         /// <summary>
         /// Mandatory, not defensive: an N-edition or Media Foundation-less profile cannot open
         /// the cached mp4 at all, and without this the soundtrack would simply be absent with
-        /// no explanation. The bed stays suppressed under Replace — restarting it mid-takeover
-        /// would be a louder fault than the silence.
+        /// no explanation. #861: an error from a player this takeover no longer owns is
+        /// ignored; one from the current player fails the soundtrack, which under Replace
+        /// brings the drone and voices back rather than leaving the takeover silent.
         /// </summary>
         private void OnSoundtrackErrorReceived(VideoPlayer source, string message)
         {
-            TakeoverBootstrap.Log.LogWarning(
-                $"[TakeoverManager] Soundtrack playback failed: {message}");
-            StopSoundtrack(null);
+            if (source == null || source != _soundtrackPlayer) return;
+            FailSoundtrack($"the soundtrack video reported an error: {message}");
         }
 #endif
 
@@ -1638,7 +1664,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                     string extension = System.IO.Path.GetExtension(path);
                     if (extension.Equals(".mp4", StringComparison.OrdinalIgnoreCase))
                     {
-                        SetupVideoForUrl(path, looping: Y4NGZCompany.Core.QuotaProgressionRegistry.LoopMedia);
+                        SetupVideoForUrl(path, looping: Y4NGZCompany.Core.QuotaProgressionRegistry.LoopVideo);
                         return;
                     }
                     if (SetupImage(path)) return;
@@ -1735,6 +1761,11 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             EnsureRenderTexture();
             _usingConfiguredVideoSource = configuredSource;
             _videoPlayer = gameObject.AddComponent<VideoPlayer>();
+            // #861: before the source. In the native fixture a player that was given its url while
+            // playOnAwake was still true started by itself and never fed the AudioSource routed
+            // below, whatever was set afterwards; with playOnAwake off first, the same player is
+            // heard and starts only at PrimeVideoForDisplay's Play().
+            _videoPlayer.playOnAwake = false;
             _videoPlayer.source = VideoSource.Url;
             _videoPlayer.url = path;
             _videoPlayer.renderMode = VideoRenderMode.RenderTexture;
@@ -1747,6 +1778,9 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 // player's own track to the soundtrack source instead of opening the file twice.
                 _videoPlayer.audioOutputMode = VideoAudioOutputMode.AudioSource;
                 _videoPlayer.controlledAudioTrackCount = 1;
+                // #861: enabled explicitly, because WatchSoundtrack confirms the soundtrack only
+                // on a prepared, enabled track routed to its source.
+                _videoPlayer.EnableAudioTrack(0, true);
                 _videoPlayer.SetTargetAudioSource(0, EnsureSoundtrackSource());
             }
             else
@@ -1757,7 +1791,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 // Precedence (#715): a playing soundtrack mutes the media's own track.
                 _videoPlayer.audioOutputMode =
                     configuredSource
-                    && Y4NGZCompany.Core.QuotaProgressionRegistry.EnableMediaAudio
+                    && Y4NGZCompany.Core.QuotaProgressionRegistry.PlayVideoSound
                     && !_soundtrackPlan.Active
                         ? VideoAudioOutputMode.Direct
                         : VideoAudioOutputMode.None;
@@ -1765,7 +1799,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 #else
             _videoPlayer.audioOutputMode = VideoAudioOutputMode.None;
 #endif
-            _videoPlayer.playOnAwake = false;
             TakeoverBootstrap.Log.LogInfo(
                 $"[TakeoverManager] Preparing {(configuredSource ? "configured" : "default")} MP4 "
                 + $"'{System.IO.Path.GetFileName(path)}' through VideoPlayer.url.");
@@ -1798,8 +1831,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             }
         }
 
-        // Shared video-setup path so the Mask Man sequence can reuse the same
-        // RT/VideoPlayer plumbing with a different clip and looping behaviour.
+        // Video setup for a bundled VideoClip (the fallback when the loose mp4 is
+        // missing); shares the RT/VideoPlayer plumbing with the url path.
         private void SetupVideoFor(VideoClip clip, bool looping)
         {
             if (clip == null) return;
@@ -1808,12 +1841,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             _usingConfiguredVideoSource = false;
 
             _videoPlayer = gameObject.AddComponent<VideoPlayer>();
+            // #861: before the clip, for the reason SetupVideoForUrl gives.
+            _videoPlayer.playOnAwake     = false;
             _videoPlayer.clip            = clip;
             _videoPlayer.renderMode      = VideoRenderMode.RenderTexture;
             _videoPlayer.targetTexture   = _renderTexture;
             _videoPlayer.isLooping       = looping;
             _videoPlayer.audioOutputMode = VideoAudioOutputMode.None;
-            _videoPlayer.playOnAwake     = false;
             TakeoverBootstrap.Log.LogInfo(
                 $"[Diag/RT] VP.targetTexture id={(_videoPlayer.targetTexture != null ? _videoPlayer.targetTexture.GetInstanceID().ToString() : "NULL")} " +
                 $"match={_videoPlayer.targetTexture == _renderTexture} clip='{(_videoPlayer.clip != null ? _videoPlayer.clip.name : "null")}'");
@@ -1923,6 +1957,11 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 $"(clip='{(source != null && source.clip != null ? source.clip.name : "null")}' " +
                 $"url='{(source != null ? source.url : string.Empty)}'). " +
                 "This is why the takeover has no picture; the static fallback will carry the sequence.");
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            // #861: when this player's track IS the soundtrack, its error is the soundtrack's too.
+            if (source != null && source == _videoPlayer && _soundtrackPlan.Kind == TakeoverSoundtrackKind.ReuseVideoTrack)
+                FailSoundtrack($"the takeover video it shares reported an error: {message}");
+#endif
         }
 
         private void OnVideoPrepareCompleted(VideoPlayer source)
@@ -2021,7 +2060,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         }
 
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-        // Longest a UseMediaLengthAsDuration hold waits for the configured
+        // Longest a HoldForWholeVideo hold waits for the configured
         // source to prepare before giving up and leaving the configured
         // Takeover Duration in place. Generous because a cached link is read
         // off disk by the same decoder that PrimeVideoForDisplay stopped
@@ -2064,13 +2103,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             {
                 _mediaLengthSeconds = Mathf.Clamp((float)_videoPlayer.length, 3f, MediaLengthMaxSeconds);
                 TakeoverBootstrap.Log.LogInfo(
-                    $"[TakeoverManager] UseMediaLengthAsDuration: holding for the configured video's "
+                    $"[TakeoverManager] HoldForWholeVideo: holding for the configured video's "
                     + $"{_mediaLengthSeconds:F1}s (reported {_videoPlayer.length:F1}s after {waited:F1}s of prepare).");
             }
             else
             {
                 TakeoverBootstrap.Log.LogInfo(
-                    "[TakeoverManager] UseMediaLengthAsDuration: no usable length from the configured video after "
+                    "[TakeoverManager] HoldForWholeVideo: no usable length from the configured video after "
                     + $"{waited:F1}s ({(_usingConfiguredVideoSource ? "still the configured source" : "fell back to the default video")}); "
                     + "keeping the configured Takeover Duration.");
             }
@@ -2209,6 +2248,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             }
 
             var player = gameObject.AddComponent<VideoPlayer>();
+            // #861: before the url, for the reason SetupVideoForUrl gives.
+            player.playOnAwake = false;
             player.source = VideoSource.Url;
             player.url = source;
             player.renderMode = VideoRenderMode.RenderTexture;
@@ -2218,7 +2259,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             // THE takeover's media, of which there is exactly one; six simultaneous audio tracks
             // would be noise, not a feature.
             player.audioOutputMode = VideoAudioOutputMode.None;
-            player.playOnAwake = false;
             entry.Player = player;
             HardenAndPrepare(player);
             // Play() implies Prepare(), and nothing waits on this player - the picture appears
@@ -2390,6 +2430,12 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                     "[TakeoverManager] No default takeover video to fall back to; leaving the current source in place.");
                 return;
             }
+
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            // #861: the player about to be destroyed carries the soundtrack's track too.
+            if (_soundtrackPlan.Kind == TakeoverSoundtrackKind.ReuseVideoTrack)
+                FailSoundtrack("the takeover video it shares did not prepare in time and was replaced by the default video");
+#endif
 
             if (_videoPlayer != null)
             {
@@ -3529,6 +3575,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         // Step 4 — Mumble Audio
         // ─────────────────────────────────────────────────────────────────────
 
+        // Starts the voice loop at most once per takeover. RestoreAll clears the handle.
+        private void StartMumble()
+        {
+            if (_mumbleCoroutine != null || _mumbleSource != null) return;
+            _mumbleCoroutine = StartCoroutine(PlayMumbleSequence());
+        }
+
         private IEnumerator PlayMumbleSequence()
         {
             // Pool is chosen once per takeover: an override that finishes
@@ -3537,10 +3590,12 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             AudioClip[] mumbleClips = TakeoverBootstrap.MumbleClips;
             string mumbleSource = "bundle";
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
-            if (_useQuotaProgressionPayload)
+            // #861: the voices this takeover's audio decision captured. A partial pool plays
+            // only its ready files; the bundled voices play only when none was ready.
+            if (_useQuotaProgressionPayload && _audio.Voices.Length > 0)
             {
-                AudioClip[] configured = TakeoverAudioOverrides.GetMumbleClips();
-                if (configured.Length > 0) { mumbleClips = configured; mumbleSource = "config"; }
+                mumbleClips = _audio.Voices;
+                mumbleSource = "config";
             }
 #endif
 
@@ -3729,7 +3784,13 @@ namespace Y4NGZCompany.ShipSystems.Takeover
         private IEnumerator CRTTransition()
         {
             // Kill audio and dialogue — the "TV" is shutting off
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            // #861: closed first, so a soundtrack failure from here on recovers nothing.
+            _audioBedOpen = false;
+#endif
             if (_dialogueCanvasGO != null) { Destroy(_dialogueCanvasGO); _dialogueCanvasGO = null; }
+            // The handle stays set until RestoreAll, so nothing can start the loop again.
+            if (_mumbleCoroutine != null) StopCoroutine(_mumbleCoroutine);
             if (_mumbleSource != null) _mumbleSource.Stop();
             if (_alarmSource != null) _alarmSource.Stop();
             if (_droneSource != null) _droneSource.Stop();
@@ -4020,28 +4081,29 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 _videoPlayer = null;
             }
 #if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            // #861: closed before anything below can raise a player event, so no failure from
+            // here on starts a bed layer: ForceRestore never revives audio.
+            _audioBedOpen = false;
+            _droneSuppressed = false;
+            _mumbleSuppressed = false;
+            _soundtrackConfirmed = false;
             // #715. Order matters: the hidden player must let go of the dummy RT before the RT
             // is released, and the AudioSource must outlive the player that targets it.
             if (_soundtrackCoroutine != null) { StopCoroutine(_soundtrackCoroutine); _soundtrackCoroutine = null; }
-            if (_soundtrackPlayer != null)
-            {
-                try { _soundtrackPlayer.Stop(); } catch { }
-                _soundtrackPlayer.errorReceived -= OnSoundtrackErrorReceived;
-                Destroy(_soundtrackPlayer);
-                _soundtrackPlayer = null;
-            }
-            if (_soundtrackDummyRT != null)
-            {
-                _soundtrackDummyRT.Release();
-                Destroy(_soundtrackDummyRT);
-                _soundtrackDummyRT = null;
-            }
+            DisposeSoundtrackPlayer();
             if (_soundtrackSource != null) { Destroy(_soundtrackSource.gameObject); _soundtrackSource = null; }
             _soundtrackPlan = default;
 #endif
+            if (_mumbleCoroutine != null) { StopCoroutine(_mumbleCoroutine); _mumbleCoroutine = null; }
             if (_alarmSource  != null) { Destroy(_alarmSource.gameObject); _alarmSource = null; }
             if (_droneSource  != null) { Destroy(_droneSource.gameObject); _droneSource = null; }
             if (_mumbleSource != null) { Destroy(_mumbleSource.gameObject); _mumbleSource = null; }
+#if Y4NGZCOMPANY_CUSTOMPASS_PUBLIC
+            // #861: nothing plays this takeover's clips any more; the next preparation may evict
+            // them.
+            _audio = TakeoverAudioSnapshot.Empty;
+            TakeoverAudioOverrides.ReleaseCapture();
+#endif
             if (_dialogueCanvasGO != null) { Destroy(_dialogueCanvasGO); _dialogueCanvasGO = null; }
             // Restore OpenBodyCams first, preserving its original ordering
             // relative to the physical-surface bridge. Both must detach from

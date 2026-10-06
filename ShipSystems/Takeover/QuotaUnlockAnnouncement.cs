@@ -361,8 +361,7 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             }
         }
 
-        // Per-save one-shot tracking, same ES3 pattern as
-        // TakeoverManager's Y4NGZ_MaskManFired flag.
+        // Per-save one-shot tracking through ES3.
         private int GetLastAnnouncedQuota()
         {
             string saveName = GameNetworkManager.Instance?.currentSaveFileName;
@@ -460,6 +459,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
 
             if (summary != null && summary.Enabled)
             {
+                // #862: moons read as the terminal shows them, minus vanilla's numeric prefix.
+                foreach (string name in summary.Moons) lines.Add("MOON · " + DisplayName(QuotaProgressionRegistry.MoonKey(name)));
                 foreach (string name in summary.Suits) lines.Add("SUIT · " + DisplayName(name));
                 foreach (string name in summary.StoreItems) lines.Add("STORE · " + DisplayName(name));
                 if (summary.TokensPerPlayer > 0) lines.Add($"+{summary.TokensPerPlayer} TOKENS PER PLAYER");
@@ -849,14 +850,8 @@ namespace Y4NGZCompany.ShipSystems.Takeover
             hdrp.clearColorMode = HDAdditionalCameraData.ClearColorMode.Color;
             hdrp.backgroundColorHDR = _rigCamera.backgroundColor;
             hdrp.volumeLayerMask = 0;
-            hdrp.customRenderingSettings = true;
-            ref FrameSettings frameSettings = ref hdrp.renderingPathCustomFrameSettings;
-            ref FrameSettingsOverrideMask overrideMask = ref hdrp.renderingPathCustomFrameSettingsOverrideMask;
-            DisableFrameSetting(ref frameSettings, ref overrideMask, FrameSettingsField.Postprocess);
-            DisableFrameSetting(ref frameSettings, ref overrideMask, FrameSettingsField.CustomPostProcess);
-            DisableFrameSetting(ref frameSettings, ref overrideMask, FrameSettingsField.AfterPostprocess);
-            DisableFrameSetting(ref frameSettings, ref overrideMask, FrameSettingsField.ExposureControl);
-            DisableFrameSetting(ref frameSettings, ref overrideMask, FrameSettingsField.Volumetrics);
+            Y4NGZCompany.ShipSystems.Rendering.CameraRenderProfile.ApplyProfile(
+                _rigCamera, Y4NGZCompany.ShipSystems.Rendering.CameraRenderRole.Unlit);
 
             var canvasGo = new GameObject("AnnouncementCanvas", typeof(RectTransform));
             canvasGo.transform.SetParent(_rigRoot.transform, false);
@@ -956,14 +951,6 @@ namespace Y4NGZCompany.ShipSystems.Takeover
                 SetLayerRecursive(child.gameObject, layer);
         }
 
-        private static void DisableFrameSetting(
-            ref FrameSettings frameSettings,
-            ref FrameSettingsOverrideMask overrideMask,
-            FrameSettingsField field)
-        {
-            frameSettings.SetEnabled(field, false);
-            overrideMask.mask[(uint)field] = true;
-        }
 
         private void RenderRig()
         {

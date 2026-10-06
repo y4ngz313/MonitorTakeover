@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using HarmonyLib;
+using Unity.Netcode;
 using UnityEngine;
 
 namespace Y4NGZCompany.Core
@@ -101,18 +102,73 @@ namespace Y4NGZCompany.Core
         [HarmonyPostfix]
         static void OnParsePlayerSentence(Terminal __instance, ref TerminalNode __result)
         {
-            if (TryGetLockedItemName(__instance, __result, out string itemName))
-                __result = BuildLockedNode(itemName);
+            if (TryGetLockedText(__instance, __result, out string lockedText))
+                __result = BuildLockedNode(lockedText);
         }
 
         [HarmonyPatch(typeof(Terminal), "LoadNewNodeIfAffordable")]
         [HarmonyPrefix]
         static bool OnLoadNewNodeIfAffordable(Terminal __instance, TerminalNode node)
         {
-            if (!TryGetLockedItemName(__instance, node, out string itemName)) return true;
+            if (!TryGetLockedText(__instance, node, out string lockedText)) return true;
             __instance.useCreditsCooldown = false;
-            __instance.LoadNewNode(BuildLockedNode(itemName));
+            __instance.LoadNewNode(BuildLockedNode(lockedText));
             return false;
+        }
+
+        /// <summary>
+        /// #862: the host-authoritative half of the moon gate. The two terminal patches above
+        /// stop a patched client before it ever sends the RPC; this stops everything else — an
+        /// unpatched client, another terminal mod, a route change issued from code. Runs on
+        /// the server only and refuses the route change outright; vanilla passes the debited
+        /// credit total in the same RPC rather than debiting first, so nothing has to be
+        /// refunded. Staying on the current moon is never refused, even if that moon is locked.
+        /// </summary>
+        [HarmonyPatch(typeof(StartOfRound), nameof(StartOfRound.ChangeLevelServerRpc), new[] { typeof(int), typeof(int) })]
+        [HarmonyPrefix]
+        static bool OnChangeLevelServerRpc(StartOfRound __instance, int levelID)
+        {
+            NetworkManager network = NetworkManager.Singleton;
+            if (network == null || !network.IsServer) return true;
+            if (__instance != null && __instance.currentLevelID == levelID) return true;
+            if (!TryGetLockedMoon(levelID, out string moonName, out int quota)) return true;
+
+            Y4NGZCore.Diagnostics.ModuleLog.Takeover?.LogWarning(
+                $"[QuotaProgression] Refused a route change to '{moonName}' (level {levelID}): "
+                + (quota > 0 ? $"it unlocks at quota {quota}." : "it is quota-locked."));
+            return false;
+        }
+
+        private static bool TryGetLockedText(Terminal terminal, TerminalNode node, out string lockedText)
+        {
+            lockedText = null;
+            if (TryGetLockedItemName(terminal, node, out string itemName))
+            {
+                lockedText = $"\n\n{itemName} is not currently available.\nThe Company will provision it after a future quota.\n\n";
+                return true;
+            }
+
+            // #862: a route node carries the destination's level index. -1 is "no route" and
+            // -2 is vanilla's "moons" catalogue sentinel; neither names a moon.
+            if (node == null || node.buyRerouteToMoon < 0) return false;
+            if (!TryGetLockedMoon(node.buyRerouteToMoon, out string moonName, out int quota)) return false;
+            lockedText = quota > 0
+                ? $"\n\nRouting to {moonName} is not currently authorized.\nThe Company will open this route after quota {quota}.\n\n"
+                : $"\n\nRouting to {moonName} is not currently authorized.\nThe Company will open this route after a future quota.\n\n";
+            return true;
+        }
+
+        private static bool TryGetLockedMoon(int routeIndex, out string moonName, out int quota)
+        {
+            moonName = null;
+            quota = 0;
+            SelectableLevel[] levels = StartOfRound.Instance?.levels;
+            if (levels == null || routeIndex < 0 || routeIndex >= levels.Length || levels[routeIndex] == null) return false;
+            string planetName = levels[routeIndex].PlanetName;
+            if (QuotaProgressionRegistry.IsMoonUnlocked(planetName)) return false;
+            moonName = QuotaProgressionRegistry.MoonKey(planetName);
+            QuotaProgressionRegistry.TryGetMoonUnlockQuota(planetName, out quota);
+            return true;
         }
 
         private static bool TryGetLockedItemName(Terminal terminal, TerminalNode node, out string itemName)
@@ -128,7 +184,7 @@ namespace Y4NGZCompany.Core
 
         private static TerminalNode _lockedNode;
 
-        private static TerminalNode BuildLockedNode(string itemName)
+        private static TerminalNode BuildLockedNode(string displayText)
         {
             if (_lockedNode == null)
             {
@@ -142,7 +198,7 @@ namespace Y4NGZCompany.Core
                 _lockedNode.storyLogFileID = -1;
                 _lockedNode.playSyncedClip = -1;
             }
-            _lockedNode.displayText = $"\n\n{itemName} is not currently available.\nThe Company will provision it after a future quota.\n\n";
+            _lockedNode.displayText = displayText;
             return _lockedNode;
         }
     }

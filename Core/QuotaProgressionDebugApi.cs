@@ -30,7 +30,9 @@ namespace Y4NGZCompany.Core
                 // files)"), so Y4NGZCompany.Plugin — Contracted's `internal` plugin type — is
                 // not reachable from it after the split. Same source in the monolith.
                 Y4NGZCore.Diagnostics.ModuleLog.Takeover.LogWarning(
-                    $"QuotaProgressionDebugApi.ForceCompletedQuota failed: {ex.Message}");
+                    // #782: the whole exception, not its message. A bare "Object reference not set"
+                    // once cost a full diagnosis pass to locate; the stack names the site.
+                    $"QuotaProgressionDebugApi.ForceCompletedQuota failed: {ex}");
                 return ForcedQuotaCompletionResult.Unavailable;
             }
         }
